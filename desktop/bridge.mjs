@@ -1,0 +1,199 @@
+import { pathToFileURL } from "node:url";
+import { join } from "node:path";
+
+const coreDir = process.env.PI_SWITCH_CORE_DIR || join(import.meta.dirname, "..", "src");
+const fromCore = file => import(pathToFileURL(join(coreDir, file)).href);
+
+const providers = await fromCore("providers.js");
+const store = await fromCore("store.js");
+const mcp = await fromCore("mcp.js");
+const skills = await fromCore("skills.js");
+const agents = await fromCore("agents.js");
+const profiles = await fromCore("profiles.js");
+const doctor = await fromCore("doctor.js");
+const keychain = await fromCore("keychain.js");
+const importer = await fromCore("import-ccswitch.js");
+const { spawn } = await import("node:child_process");
+
+function publicProvider(row) {
+  return {
+    name: row.name,
+    api: row.api,
+    baseUrl: row.baseUrl,
+    keyOk: row.keyOk,
+    keySource: row.keySource,
+    keyError: row.keyError,
+    keyInline: row.keyInline,
+    models: row.models,
+    modelObjects: row.modelObjects,
+    isDefault: row.isDefault,
+    defaultModel: row.defaultModel,
+  };
+}
+
+function dashboard() {
+  const settings = store.loadSettings();
+  let profileRows = [];
+  try {
+    profileRows = profiles.listProfiles();
+  } catch {
+    // Doctor reports the concrete profile config error.
+  }
+  return {
+    providers: providers.listProviders().map(publicProvider),
+    settings: {
+      defaultProvider: settings.defaultProvider,
+      defaultModel: settings.defaultModel,
+      defaultThinkingLevel: settings.defaultThinkingLevel,
+    },
+    mcp: mcp.listServers().map(({ env, ...row }) => row),
+    skillPaths: skills.listSkillPaths(),
+    skillCatalog: skills.listSkills(),
+    agents: agents.listAgents(),
+    profiles: profileRows,
+    apiTypes: providers.API_TYPES,
+    thinkingLevels: providers.THINKING_LEVELS,
+    ccSwitchAvailable: importer.ccSwitchAvailable(),
+  };
+}
+
+function modelDefaults(id, providerName, patch = {}) {
+  return {
+    id,
+    name: `${id} (${providerName})`,
+    contextWindow: 200_000,
+    maxTokens: 32_768,
+    input: ["text"],
+    reasoning: false,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...patch,
+  };
+}
+
+async function execute(action, payload = {}) {
+  switch (action) {
+    case "dashboard":
+      return dashboard();
+    case "activateProvider":
+      return providers.setDefault(payload.provider, payload.model);
+    case "setThinking":
+      return providers.setThinking(payload.level);
+    case "testProvider": {
+      const row = providers.listProviders().find(item => item.name === payload.name);
+      if (!row) throw new Error(`provider "${payload.name}" not found`);
+      const result = await providers.probeProvider(row.raw);
+      return { ...result, diff: result.ok ? providers.diffModels(row.models, result.models) : null };
+    }
+    case "addProvider": {
+      const { name, baseUrl, api, key, model, storeKeychain } = payload;
+      if (!key) throw new Error("API key is required");
+      let apiKey = key;
+      if (storeKeychain && process.platform === "darwin") {
+        const service = keychain.serviceNameFor(name);
+        keychain.setKey(service, key);
+        apiKey = keychain.keychainSpec(service);
+      }
+      return providers.upsertProvider(name, {
+        baseUrl: baseUrl.replace(/\/+$/, ""),
+        api,
+        apiKey,
+        ...(api === "anthropic-messages" ? { authHeader: true } : {}),
+        models: [modelDefaults(model, name)],
+      });
+    }
+    case "updateProvider":
+      return providers.patchProvider(payload.name, { baseUrl: payload.baseUrl.replace(/\/+$/, ""), api: payload.api });
+    case "rotateKey": {
+      const row = providers.listProviders().find(item => item.name === payload.name);
+      if (!row) throw new Error(`provider "${payload.name}" not found`);
+      if (!payload.key) throw new Error("API key is required");
+      if (payload.storeKeychain && process.platform === "darwin") {
+        const existing = keychain.parseKeychainSpec(row.apiKeySpec);
+        const service = existing?.service ?? keychain.serviceNameFor(payload.name);
+        keychain.setKey(service, payload.key);
+        if (!existing) providers.patchProvider(payload.name, { apiKey: keychain.keychainSpec(service) });
+        return { storage: "keychain" };
+      }
+      providers.patchProvider(payload.name, { apiKey: payload.key });
+      return { storage: "plaintext" };
+    }
+    case "deleteProvider":
+      providers.deleteProvider(payload.name);
+      return true;
+    case "upsertModel": {
+      const exists = (providers.getProvider(payload.provider)?.models || []).some(model => model.id === payload.model.id);
+      return providers.upsertModel(
+        payload.provider,
+        exists ? payload.model : modelDefaults(payload.model.id, payload.provider, payload.model),
+      );
+    }
+    case "deleteModel":
+      providers.deleteModel(payload.provider, payload.id);
+      return true;
+    case "syncProvider": {
+      const row = providers.listProviders().find(item => item.name === payload.name);
+      if (!row) throw new Error(`provider "${payload.name}" not found`);
+      const result = await providers.probeProvider(row.raw);
+      if (!result.ok) throw new Error(result.error);
+      const diff = providers.diffModels(row.models, result.models);
+      if (payload.apply) {
+        for (const id of diff.extra) providers.upsertModel(row.name, modelDefaults(id, row.name));
+      }
+      return { ...result, diff };
+    }
+    case "toggleMcp":
+      return mcp.setDisabled(payload.name, payload.disabled, { scope: payload.scope || "global" });
+    case "addSkillPath":
+      return skills.addSkillPath(payload.path);
+    case "removeSkillPath":
+      skills.removeSkillPath(payload.path);
+      return true;
+    case "pruneSkillPaths":
+      return skills.pruneSkillPaths();
+    case "doctor":
+      return doctor.runDoctor({ probe: payload.probe === true });
+    case "importPreview": {
+      if (!importer.ccSwitchAvailable()) return { importable: [], skipped: [] };
+      const rows = importer.readCcSwitchProviders();
+      const usable = rows.filter(row => row.converted);
+      const plan = importer.planImportNames(usable, providers.listProviders().map(row => row.name));
+      return {
+        importable: plan.map(({ row, name, renamedFrom }) => ({ sourceName: row.name, appType: row.appType, targetName: name, renamedFrom })),
+        skipped: rows.filter(row => !row.converted).map(row => ({ name: row.name, reason: row.reason })),
+      };
+    }
+    case "importAll": {
+      const rows = importer.readCcSwitchProviders().filter(row => row.converted);
+      const plan = importer.planImportNames(rows, providers.listProviders().map(row => row.name));
+      for (const { row, name } of plan) providers.upsertProvider(name, row.converted);
+      return { count: plan.length };
+    }
+    case "launchProfile": {
+      const profile = profiles.resolveProfile(payload.name);
+      const command = `cd ${shellQuote(profile.cwd)} && pi --mode-start ${shellQuote(profile.mode)}`;
+      const script = `tell application "Terminal" to do script ${JSON.stringify(command)}`;
+      const child = spawn("/usr/bin/osascript", ["-e", script], { detached: true, stdio: "ignore" });
+      child.unref();
+      return true;
+    }
+    default:
+      throw new Error(`unknown desktop action: ${action}`);
+  }
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+let input = "";
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) input += chunk;
+
+try {
+  const request = JSON.parse(input || "{}");
+  const data = await execute(request.action, request.payload);
+  process.stdout.write(JSON.stringify({ ok: true, data }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, error: error?.message || String(error) }));
+  process.exitCode = 1;
+}

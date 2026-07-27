@@ -1,0 +1,37 @@
+{
+  "name": "pi-switch",
+  "version": "0.3.0",
+  "description": "Provider, model, profile, MCP, skill, and agent switcher for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "pi-switch": "bin/pi-switch.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test 'test/*.test.mjs'",
+    "dev:web": "vite --config desktop/vite.config.js",
+    "build:web": "vite build --config desktop/vite.config.js",
+    "desktop": "tauri dev",
+    "build:desktop": "tauri build",
+    "open:desktop": "open 'src-tauri/target/release/bundle/macos/Pi Switch.app'"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "lucide-react": "^0.542.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^7.3.0"
+  }
+}
