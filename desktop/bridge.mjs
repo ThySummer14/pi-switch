@@ -1,5 +1,7 @@
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 
 const coreDir = process.env.PI_SWITCH_CORE_DIR || join(import.meta.dirname, "..", "src");
 const fromCore = file => import(pathToFileURL(join(coreDir, file)).href);
@@ -70,6 +72,67 @@ function modelDefaults(id, providerName, patch = {}) {
   };
 }
 
+function piBinary() {
+  if (process.env.PI_SWITCH_PI_BIN) return process.env.PI_SWITCH_PI_BIN;
+  const local = join(homedir(), ".local", "bin", "pi");
+  return existsSync(local) ? local : "pi";
+}
+
+function appendLimited(current, chunk, limit = 8_000) {
+  return `${current}${chunk}`.slice(-limit);
+}
+
+function cleanProbeError(stdout, stderr, secret) {
+  let text = `${stderr}\n${stdout}`.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  if (secret) text = text.split(secret).join("[REDACTED]");
+  return text.slice(-2_000) || "Pi 未返回具体错误";
+}
+
+function testProviderWithPi(row, { timeoutMs = 30_000 } = {}) {
+  const model = row.defaultModel || row.models[0];
+  if (!model) return Promise.resolve({ ok: false, ms: 0, error: "这个 Provider 尚未配置模型" });
+  const secret = store.resolveApiKey(row.apiKeySpec).value;
+  const args = [
+    "--print",
+    "--no-session",
+    "--no-tools",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-approve",
+    "--thinking", "off",
+    "--provider", row.name,
+    "--model", model,
+    "Reply with OK.",
+  ];
+  const started = Date.now();
+  return new Promise(resolve => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const child = spawn(piBinary(), args, { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.on("data", chunk => { stdout = appendLimited(stdout, chunk); });
+    child.stderr.on("data", chunk => { stderr = appendLimited(stderr, chunk); });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    child.on("error", error => {
+      clearTimeout(timer);
+      resolve({ ok: false, ms: Date.now() - started, model, error: error.message });
+    });
+    child.on("close", code => {
+      clearTimeout(timer);
+      const ms = Date.now() - started;
+      if (timedOut) resolve({ ok: false, ms, model, error: `真实调用 ${timeoutMs / 1000} 秒后超时` });
+      else if (code === 0) resolve({ ok: true, ms, model });
+      else resolve({ ok: false, ms, model, error: cleanProbeError(stdout, stderr, secret) });
+    });
+  });
+}
+
 async function execute(action, payload = {}) {
   switch (action) {
     case "dashboard":
@@ -81,8 +144,14 @@ async function execute(action, payload = {}) {
     case "testProvider": {
       const row = providers.listProviders().find(item => item.name === payload.name);
       if (!row) throw new Error(`provider "${payload.name}" not found`);
-      const result = await providers.probeProvider(row.raw);
-      return { ...result, diff: result.ok ? providers.diffModels(row.models, result.models) : null };
+      return testProviderWithPi(row);
+    }
+    case "readProviderKey": {
+      const row = providers.listProviders().find(item => item.name === payload.name);
+      if (!row) throw new Error(`provider "${payload.name}" not found`);
+      const resolved = store.resolveApiKey(row.apiKeySpec);
+      if (!resolved.value) throw new Error(resolved.error || "API key 无法读取");
+      return { key: resolved.value };
     }
     case "addProvider": {
       const { name, baseUrl, api, key, model, storeKeychain } = payload;

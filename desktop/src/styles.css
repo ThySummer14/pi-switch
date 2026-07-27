@@ -615,6 +615,28 @@ select:disabled {
   padding: 0 9px;
 }
 
+.health-detail-button {
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  margin-right: -7px;
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.health-detail-button:hover {
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+.health-detail-button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
 .badge.success,
 .health.success {
   background: var(--success-soft);
@@ -1014,6 +1036,23 @@ code {
   background: var(--surface);
 }
 
+.secret-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 8px;
+}
+
+.secret-field .icon-button {
+  width: 38px;
+  height: 38px;
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .check-row {
   display: flex;
   align-items: flex-start;
@@ -1065,6 +1104,23 @@ code {
 .preview-list span {
   color: var(--text-3);
   font-size: 11px;
+}
+
+.missing-model-list code {
+  overflow-wrap: anywhere;
+}
+
+.connection-error-detail pre {
+  max-height: 280px;
+  overflow: auto;
+  margin: 16px 0 0;
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 12px;
+  color: var(--danger);
+  font: 11px/1.55 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .doctor-summary {

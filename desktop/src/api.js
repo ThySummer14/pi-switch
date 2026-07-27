@@ -82,7 +82,10 @@ export async function callBridge(action, payload = {}) {
     ];
   }
   if (action === "testProvider") {
-    return { ok: true, ms: 284, models: ["claude-opus-5", "claude-sonnet-5"], diff: { missing: [], aliased: [], extra: [], unknown: false } };
+    return { ok: true, ms: 284, model: "claude-opus-5" };
+  }
+  if (action === "readProviderKey") {
+    return { key: "demo-key-not-a-secret" };
   }
   if (action === "syncProvider") {
     return { ok: true, models: [], diff: { missing: [], aliased: [], extra: ["claude-haiku-5"], unknown: false } };
