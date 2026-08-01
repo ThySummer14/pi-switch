@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -56,4 +57,65 @@ test("doctor rejects a missing desktop launch directory", async () => {
   const profileFinding = findings.find(item => item.area === "profiles" && item.message.includes("desktopCwd"));
   assert.equal(profileFinding?.level, "error");
   assert.equal(profileFinding?.message, "code: desktopCwd does not exist");
+});
+
+test("doctor reports local and skipped network stages through the optional callback", async () => {
+  const stages = [];
+  await runDoctor({ cwd: dir, probe: true, onStage: stage => stages.push(stage) });
+  assert.deepEqual(stages.map(stage => stage.id), ["local", "network"]);
+  assert.equal(stages[0].ok, false);
+  assert.match(stages[1].detail, /models\.json 无效/);
+});
+
+test("doctor reports a successful Provider network stage", async () => {
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ defaultProvider: "relay", defaultModel: "m1" }));
+  writeFileSync(join(dir, "profiles.json"), JSON.stringify({
+    defaultProfile: "code",
+    profiles: { code: { mode: "code", cwd: dir } },
+  }));
+  const server = createServer((request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: "m1" }] }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    writeFileSync(join(dir, "models.json"), JSON.stringify({ providers: {
+      relay: {
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        api: "openai-completions",
+        apiKey: "doctor-stage-key",
+        models: [{ id: "m1" }],
+      },
+    } }));
+    const stages = [];
+    const findings = await runDoctor({ cwd: dir, probe: true, onStage: stage => stages.push(stage) });
+    assert.ok(Array.isArray(findings));
+    assert.deepEqual(stages.map(stage => stage.id), ["local", "network"]);
+    assert.equal(stages[1].ok, true);
+    assert.match(stages[1].detail, /1 个 Provider 已检查/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("doctor capability warnings keep their capability area", async () => {
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ defaultProvider: "known", defaultModel: "grok-4.5" }));
+  writeFileSync(join(dir, "profiles.json"), JSON.stringify({
+    defaultProfile: "code",
+    profiles: { code: { mode: "code", cwd: dir } },
+  }));
+  writeFileSync(join(dir, "models.json"), JSON.stringify({ providers: {
+    known: {
+      baseUrl: "https://known.example",
+      api: "openai-completions",
+      apiKey: "doctor-capability-key",
+      models: [{ id: "grok-4.5", input: ["text"], reasoning: false }],
+    },
+  } }));
+
+  const findings = await runDoctor({ cwd: dir });
+  const reasoningWarning = findings.find(item => item.message.includes("reasoning is disabled but the model family is known to support it"));
+  assert.equal(reasoningWarning?.level, "warn");
+  assert.equal(reasoningWarning?.area, "capability");
+  assert.equal(findings.some(item => item.area === "warn"), false);
 });

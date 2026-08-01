@@ -849,6 +849,30 @@ select:disabled {
   background: var(--surface);
 }
 
+/* Keep very large model catalogs responsive without adding a list dependency. */
+.model-list-scroll {
+  max-height: 640px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.model-list-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.virtual-model-row {
+  position: absolute;
+  right: 0;
+  left: 0;
+}
+
+.virtual-model-row > .table-row {
+  height: 100%;
+  box-sizing: border-box;
+}
+
 .table-head,
 .table-row {
   display: grid;

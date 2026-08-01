@@ -114,7 +114,16 @@ export async function callBridge(action, payload = {}) {
       { level: "ok", area: "profiles", message: "3 startup profiles valid" },
       { level: "warn", area: "mcp", message: "exa references EXA_API_KEY, which is unset" },
     ];
-    return payload.probe ? [...findings, { level: "ok", area: "reach", message: "botcf: reachable in 284ms, 2 models listed" }] : findings;
+    return {
+      findings: payload.probe ? [...findings, { level: "ok", area: "reach", message: "botcf: reachable in 284ms, 2 models listed" }] : findings,
+      stages: payload.probe
+        ? [
+            { id: "local", label: "本地配置", ok: true, ms: 12, detail: "0 个错误，1 个警告" },
+            { id: "network", label: "Provider 网络检查", ok: true, ms: 284, detail: "1 个 Provider 已检查" },
+          ]
+        : [{ id: "local", label: "本地配置", ok: true, ms: 12, detail: "0 个错误，1 个警告" }],
+      probed: payload.probe === true,
+    };
   }
   if (action === "testProvider") {
     return { ok: true, ms: 284, model: "claude-opus-5" };
@@ -129,6 +138,10 @@ export async function callBridge(action, payload = {}) {
       diff: { missing: [], aliased: [], extra: ["claude-haiku-5"], unknown: false },
       capabilityUpdates: [{ id: "claude-opus-5", fields: ["input evidence", "reasoning evidence"] }],
       capabilityRefresh: { changed: ["claude-opus-5"] },
+      stages: [
+        { id: "models", label: "模型列表", ok: true, ms: 284, detail: "返回 3 个模型" },
+        { id: "capabilities", label: "能力声明", ok: true, ms: 2, detail: "发现 1 个可更新项" },
+      ],
     };
   }
   if (action === "syncProviderCatalog") {

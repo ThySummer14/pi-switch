@@ -253,12 +253,12 @@ export default function App() {
   };
 
   const openDoctor = async () => {
-    setModal({ type: "doctor", loading: true, findings: [] });
+    setModal({ type: "doctor", loading: true, findings: [], stages: [] });
     try {
-      const findings = await callBridge("doctor", { probe: false });
-      setModal({ type: "doctor", loading: false, findings });
+      const result = await callBridge("doctor", { probe: false });
+      setModal({ type: "doctor", loading: false, findings: result.findings || [], stages: result.stages || [], probed: result.probed === true });
     } catch (err) {
-      setModal({ type: "doctor", loading: false, error: err?.message || String(err), findings: [] });
+      setModal({ type: "doctor", loading: false, error: err?.message || String(err), findings: [], stages: [] });
     }
   };
 
@@ -407,7 +407,7 @@ export default function App() {
         </section>
       </main>
 
-      {modal && (
+              {modal && (
           <ModalHost
             modal={modal}
             data={data}
@@ -416,6 +416,7 @@ export default function App() {
             clearHistory={clearHistory}
             act={act}
             busy={busy}
+            setToast={setToast}
           />
       )}
       {toast && <Toast toast={toast} close={() => setToast(null)} />}
@@ -661,7 +662,31 @@ function ModelsPage({ data, focusProvider, setFocusProvider, act, setModal, busy
           <EmptyState icon={Cpu} title="尚未配置模型" action="添加模型" onAction={() => setModal({ type: "modelForm", mode: "add", provider: provider.name })} />
         ) : filteredModels.length === 0 ? (
           <EmptyState icon={Search} title="没有匹配的模型" action="清除筛选" actionIcon={X} onAction={() => { setQuery(""); setFilter("all"); }} />
-        ) : filteredModels.map(model => {
+        ) : filteredModels.length > 120 ? (
+          <VirtualizedModelRows rows={filteredModels} resetKey={`${provider.name}:${filter}:${normalizedQuery}`} renderRow={model => renderModelRow(model, {
+            provider,
+            data,
+            selectedIds,
+            toggleModelSelection,
+            busy,
+            act,
+            setModal,
+          })} />
+        ) : filteredModels.map(model => renderModelRow(model, {
+          provider,
+          data,
+          selectedIds,
+          toggleModelSelection,
+          busy,
+          act,
+          setModal,
+        }))}
+      </div>
+    </div>
+  );
+}
+
+function renderModelRow(model, { provider, data, selectedIds, toggleModelSelection, busy, act, setModal }) {
           const active = data.settings.defaultProvider === provider.name && data.settings.defaultModel === model.id;
           const capabilities = inspectModelCapabilities(model);
           const context = capabilities.contextWindowConfidence === "unknown" ? `${formatTokens(capabilities.contextWindow)}（待确认）` : formatTokens(capabilities.contextWindow);
@@ -683,7 +708,58 @@ function ModelsPage({ data, focusProvider, setFocusProvider, act, setModal, busy
               </div>
             </div>
           );
-        })}
+}
+
+function VirtualizedModelRows({ rows, resetKey, renderRow }) {
+  const scrollRef = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(640);
+  const [compact, setCompact] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width: 720px)").matches);
+  const rowHeight = compact ? 112 : 64;
+  const overscan = 8;
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleCount = Math.ceil(viewportHeight / rowHeight) + overscan * 2;
+  const end = Math.min(rows.length, start + visibleCount);
+
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return undefined;
+    const updateHeight = () => setViewportHeight(Math.max(1, element.clientHeight));
+    updateHeight();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateHeight);
+      return () => window.removeEventListener("resize", updateHeight);
+    }
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 720px)");
+    const updateCompact = event => setCompact(event.matches);
+    updateCompact(media);
+    if (media.addEventListener) media.addEventListener("change", updateCompact);
+    else media.addListener?.(updateCompact);
+    return () => {
+      if (media.removeEventListener) media.removeEventListener("change", updateCompact);
+      else media.removeListener?.(updateCompact);
+    };
+  }, []);
+
+  useEffect(() => {
+    setScrollTop(0);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [resetKey]);
+
+  return (
+    <div className="model-list-scroll" ref={scrollRef} onScroll={event => setScrollTop(event.currentTarget.scrollTop)} aria-label="模型列表">
+      <div className="model-list-spacer" style={{ height: `${rows.length * rowHeight}px` }}>
+        {rows.slice(start, end).map((model, index) => (
+          <div className="virtual-model-row" key={model.id} style={{ top: `${(start + index) * rowHeight}px`, height: `${rowHeight}px` }}>
+            {renderRow(model)}
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -828,11 +904,18 @@ function ProfilesPage({ rows, act, busy }) {
   );
 }
 
-function ModalHost({ modal, data, close, updateModal, clearHistory, act, busy }) {
+function ModalHost({ modal, data, close, updateModal, clearHistory, act, busy, setToast }) {
   const runAndClose = async (action, payload, success, options) => {
     try {
       const result = await act(action, payload, success, options);
       if (result?.skipped) return;
+      if (result?.ok === false) {
+        setToast({ type: "error", message: result.error || "操作失败" });
+        updateModal(current => current?.type === "sync"
+          ? { ...current, result: { ...current.result, ...result } }
+          : current);
+        return;
+      }
       close();
     } catch {
       // The toast keeps the error visible while the form remains open.
@@ -892,13 +975,14 @@ function ModalHost({ modal, data, close, updateModal, clearHistory, act, busy })
     return <DoctorModal modal={modal} close={close} probe={async () => {
       updateModal(current => current?.type === "doctor" ? { ...current, probeLoading: true, probeError: "" } : current);
       try {
-        const findings = await callBridge("doctor", { probe: true });
+        const result = await callBridge("doctor", { probe: true });
         updateModal(current => current?.type === "doctor" ? {
           ...current,
           probeLoading: false,
           probeError: "",
           probed: true,
-          findings,
+          findings: result.findings || [],
+          stages: result.stages || [],
         } : current);
       } catch (error) {
         updateModal(current => current?.type === "doctor" ? {
@@ -968,11 +1052,16 @@ function ModalHost({ modal, data, close, updateModal, clearHistory, act, busy })
     return (
       <Dialog title="同步模型" close={close}>
         <div className="dialog-body">
-          <p>{count || capabilityUpdates.length ? `${modal.provider.name} 的服务端检查发现 ${count ? `${count} 个新模型` : "没有新模型"}${capabilityUpdates.length ? `，以及 ${capabilityUpdates.length} 个已有模型的能力声明更新` : ""}。` : "当前模型列表和能力信息已是最新状态。"}</p>
-          {count > 0 && <div className="preview-list">{modal.result.diff.extra.map(id => <code key={id}>{id}</code>)}</div>}
-          {capabilityUpdates.length > 0 && <div className="sync-capability-preview"><strong>将刷新服务端已明确声明的能力</strong>{capabilityUpdates.map(update => <div key={update.id}><code>{update.id}</code><span>{update.fields.join("、")}</span></div>)}<small>手动编辑或已确认的能力不会被覆盖。</small></div>}
+          <StageList stages={modal.result.stages} ariaLabel="模型同步阶段" />
+          {!modal.result.ok ? (
+            <div className="connection-diagnosis sync-failure"><strong>模型列表读取失败</strong><p>{modal.result.error || "服务端没有返回可用的模型列表"}</p></div>
+          ) : <>
+            <p>{count || capabilityUpdates.length ? `${modal.provider.name} 的服务端检查发现 ${count ? `${count} 个新模型` : "没有新模型"}${capabilityUpdates.length ? `，以及 ${capabilityUpdates.length} 个已有模型的能力声明更新` : ""}。` : "当前模型列表和能力信息已是最新状态。"}</p>
+            {count > 0 && <div className="preview-list">{modal.result.diff.extra.map(id => <code key={id}>{id}</code>)}</div>}
+            {capabilityUpdates.length > 0 && <div className="sync-capability-preview"><strong>将刷新服务端已明确声明的能力</strong>{capabilityUpdates.map(update => <div key={update.id}><code>{update.id}</code><span>{update.fields.join("、")}</span></div>)}<small>手动编辑或已确认的能力不会被覆盖。</small></div>}
+          </>}
         </div>
-        <div className="dialog-footer"><button className="button secondary" onClick={close} disabled={busy === "syncProvider"}>取消</button>{total > 0 && <button className="button primary" disabled={busy === "syncProvider"} onClick={() => runAndClose("syncProvider", { name: modal.provider.name, apply: true }, result => `已同步 ${result.capabilityRefresh?.changed?.length || 0} 个能力更新${count ? `，添加 ${count} 个模型` : ""}`)}>{busy === "syncProvider" && <LoaderCircle size={16} className="spin" />}应用同步</button>}</div>
+        <div className="dialog-footer"><button className="button secondary" onClick={close} disabled={busy === "syncProvider"}>关闭</button>{modal.result.ok && total > 0 && <button className="button primary" disabled={busy === "syncProvider"} onClick={() => runAndClose("syncProvider", { name: modal.provider.name, apply: true }, result => `已同步 ${result.capabilityRefresh?.changed?.length || 0} 个能力更新${count ? `，添加 ${count} 个模型` : ""}`)}>{busy === "syncProvider" && <LoaderCircle size={16} className="spin" />}应用同步</button>}</div>
       </Dialog>
     );
   }
@@ -1284,10 +1373,10 @@ function McpForm({ modal, close, submit, busy }) {
   );
 }
 
-function StageList({ stages }) {
+function StageList({ stages, ariaLabel = "连接测试阶段" }) {
   if (!Array.isArray(stages) || stages.length === 0) return null;
   return (
-    <div className="stage-list" aria-label="连接测试阶段">
+    <div className="stage-list" aria-label={ariaLabel}>
       {stages.map(stage => (
         <div className={`stage-row ${stage.ok ? "ok" : "failed"}`} key={stage.id}>
           {stage.ok ? <CircleCheck size={15} /> : <CircleAlert size={15} />}
@@ -1541,6 +1630,7 @@ function DoctorModal({ modal, close, probe }) {
       <div className="dialog-body doctor-body">
         {modal.loading ? <LoadingState compact /> : modal.error ? <ErrorState message={modal.error} /> : <>
           <div className="doctor-summary"><div><strong>{errors}</strong><span>错误</span></div><div><strong>{warnings}</strong><span>警告</span></div><div><strong>{modal.findings.filter(item => item.level === "ok").length}</strong><span>通过</span></div></div>
+          <StageList stages={modal.stages} />
           {!modal.probed && <div className="doctor-probe-note">当前只检查本地配置；网络检查会逐个请求 Provider 的模型列表，不会发送聊天内容。</div>}
           {modal.probeError && <div className="field-error doctor-probe-error">网络检查失败：{modal.probeError}</div>}
           <div className="finding-list">{modal.findings.map((finding, index) => <div className={`finding ${finding.level}`} key={`${finding.area}-${index}`}>{finding.level === "error" ? <CircleAlert size={17} /> : finding.level === "warn" ? <TriangleAlert size={17} /> : <CircleCheck size={17} />}<div><strong>{finding.area}</strong><p>{finding.message}</p>{finding.fix && <small>{finding.fix}</small>}</div></div>)}</div>

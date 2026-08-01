@@ -24,7 +24,8 @@ function finding(level, area, message, fix) {
  * Run every check. `probe` also hits the network for each provider, which is
  * slower but is the only way to catch a wrong model id or a dead key.
  */
-export async function runDoctor({ probe = false, cwd = process.cwd() } = {}) {
+export async function runDoctor({ probe = false, cwd = process.cwd(), onStage } = {}) {
+  const localStarted = Date.now();
   const findings = [];
   const fileFindings = checkFiles();
   findings.push(...fileFindings);
@@ -39,7 +40,37 @@ export async function runDoctor({ probe = false, cwd = process.cwd() } = {}) {
   findings.push(...checkSkills());
   findings.push(...checkMcp(cwd));
   findings.push(...checkMaintenance());
-  if (probe && !modelsInvalid) findings.push(...(await checkReachability()));
+  const localErrors = findings.filter(item => item.level === "error").length;
+  const localWarnings = findings.filter(item => item.level === "warn").length;
+  onStage?.({
+    id: "local",
+    label: "本地配置",
+    ok: localErrors === 0,
+    ms: Date.now() - localStarted,
+    detail: `${localErrors} 个错误，${localWarnings} 个警告`,
+  });
+  if (probe && !modelsInvalid) {
+    const networkStarted = Date.now();
+    const providerCount = listProviders().length;
+    const reachability = await checkReachability();
+    findings.push(...reachability);
+    const networkErrors = reachability.filter(item => item.level === "error").length;
+    onStage?.({
+      id: "network",
+      label: "Provider 网络检查",
+      ok: networkErrors === 0,
+      ms: Date.now() - networkStarted,
+      detail: `${providerCount} 个 Provider 已检查`,
+    });
+  } else if (probe) {
+    onStage?.({
+      id: "network",
+      label: "Provider 网络检查",
+      ok: false,
+      ms: 0,
+      detail: "models.json 无效，已跳过网络检查",
+    });
+  }
   return findings;
 }
 

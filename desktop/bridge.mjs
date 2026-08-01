@@ -311,25 +311,62 @@ async function execute(action, payload = {}) {
     case "syncProvider": {
       const row = providers.listProviders().find(item => item.name === payload.name);
       if (!row) throw new Error(`provider "${payload.name}" not found`);
+      const stages = [];
+      const probeStarted = Date.now();
       const result = await providers.probeProvider(row.raw);
-      if (!result.ok) throw new Error(result.error);
+      stages.push({
+        id: "models",
+        label: "模型列表",
+        ok: result.ok,
+        ms: result.ms ?? Date.now() - probeStarted,
+        detail: result.ok ? `返回 ${result.models.length} 个模型` : result.error,
+      });
+      if (!result.ok) return { ...result, stages, diff: null, capabilityUpdates: [], capabilityRefresh: null };
       const diff = providers.diffModels(row.models, result.models);
+      const capabilityStarted = Date.now();
       const capabilityUpdates = providers.planModelCapabilityRefresh(row.name, result.modelDetails);
+      stages.push({
+        id: "capabilities",
+        label: "能力声明",
+        ok: true,
+        ms: Date.now() - capabilityStarted,
+        detail: capabilityUpdates.length > 0 ? `发现 ${capabilityUpdates.length} 个可更新项` : "没有新的明确声明",
+      });
       let capabilityRefresh = { provider: row.name, changed: [] };
       if (payload.apply) {
-        capabilityRefresh = providers.refreshModelCapabilities(row.name, result.modelDetails);
-        const details = new Map((result.modelDetails || []).map(item => [item.id, item]));
-        for (const id of diff.extra) {
-          const detail = details.get(id);
-          providers.upsertModel(row.name, {
-            id,
-            name: `${id} (${row.name})`,
-            capabilitySource: detail,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        const applyStarted = Date.now();
+        try {
+          capabilityRefresh = providers.refreshModelCapabilities(row.name, result.modelDetails);
+          const details = new Map((result.modelDetails || []).map(item => [item.id, item]));
+          for (const id of diff.extra) {
+            const detail = details.get(id);
+            providers.upsertModel(row.name, {
+              id,
+              name: `${id} (${row.name})`,
+              capabilitySource: detail,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            });
+          }
+          stages.push({
+            id: "apply",
+            label: "写入配置",
+            ok: true,
+            ms: Date.now() - applyStarted,
+            detail: `更新 ${capabilityRefresh.changed.length} 个能力，添加 ${diff.extra.length} 个模型`,
           });
+        } catch (error) {
+          stages.push({ id: "apply", label: "写入配置", ok: false, ms: Date.now() - applyStarted, detail: error?.message || String(error) });
+          return {
+            ok: false,
+            error: error?.message || String(error),
+            stages,
+            diff,
+            capabilityUpdates,
+            capabilityRefresh: null,
+          };
         }
       }
-      return { ...result, diff, capabilityUpdates, capabilityRefresh };
+      return { ...result, diff, capabilityUpdates, capabilityRefresh, stages };
     }
     case "toggleMcp":
       return mcp.setDisabled(payload.name, payload.disabled, { scope: payload.scope || "global", cwd: payload.cwd || process.cwd() });
@@ -352,8 +389,14 @@ async function execute(action, payload = {}) {
       return true;
     case "pruneSkillPaths":
       return skills.pruneSkillPaths();
-    case "doctor":
-      return doctor.runDoctor({ probe: payload.probe === true });
+    case "doctor": {
+      const stages = [];
+      const findings = await doctor.runDoctor({
+        probe: payload.probe === true,
+        onStage: stage => stages.push(stage),
+      });
+      return { findings, stages, probed: payload.probe === true };
+    }
     case "importPreview": {
       if (!importer.ccSwitchAvailable()) return { importable: [], skipped: [] };
       const rows = importer.readCcSwitchProviders();

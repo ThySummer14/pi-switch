@@ -372,11 +372,15 @@ test("desktop sync previews and applies explicit model capabilities", async () =
     const previewData = JSON.parse(preview.stdout).data;
     assert.deepEqual(previewData.capabilityUpdates.map(update => update.id), ["grok-4.5"]);
     assert.deepEqual(previewData.capabilityRefresh.changed, []);
+    assert.deepEqual(previewData.stages.map(stage => stage.id), ["models", "capabilities"]);
+    assert.equal(previewData.stages[0].ok, true);
 
     const applied = await request(true);
     assert.equal(applied.status, 0, applied.stderr);
     const appliedData = JSON.parse(applied.stdout).data;
     assert.deepEqual(appliedData.capabilityRefresh.changed, ["grok-4.5"]);
+    assert.deepEqual(appliedData.stages.map(stage => stage.id), ["models", "capabilities", "apply"]);
+    assert.equal(appliedData.stages.at(-1).ok, true);
     const saved = JSON.parse(readFileSync(modelsPath, "utf8")).providers.relay.models[0];
     assert.deepEqual(saved.input, ["text", "image"]);
     assert.equal(saved.reasoning, true);
@@ -387,4 +391,63 @@ test("desktop sync previews and applies explicit model capabilities", async () =
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
+});
+
+test("desktop sync keeps a readable failed model-list stage", async () => {
+  const failureDir = mkdtempSync(join(tmpdir(), "pi-switch-sync-failure-"));
+  writeFileSync(join(failureDir, "settings.json"), JSON.stringify({}));
+  writeFileSync(join(failureDir, "models.json"), JSON.stringify({ providers: {
+    relay: {
+      baseUrl: "http://127.0.0.1",
+      api: "openai-completions",
+      apiKey: "sync-failure-key",
+      models: [{ id: "m1" }],
+    },
+  } }));
+  const server = createServer((request, response) => {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "invalid key" } }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const modelsPath = join(failureDir, "models.json");
+    const models = JSON.parse(readFileSync(modelsPath, "utf8"));
+    models.providers.relay.baseUrl = `http://127.0.0.1:${server.address().port}`;
+    writeFileSync(modelsPath, JSON.stringify(models));
+    const result = await new Promise(resolve => {
+      const child = spawn(process.execPath, ["desktop/bridge.mjs"], {
+        cwd: new URL("..", import.meta.url),
+        env: { ...process.env, PI_CODING_AGENT_DIR: failureDir },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", chunk => { stdout += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
+      child.on("close", status => resolve({ status, stdout, stderr }));
+      child.stdin.end(JSON.stringify({ action: "syncProvider", payload: { name: "relay", apply: false } }));
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const data = JSON.parse(result.stdout).data;
+    assert.equal(data.ok, false);
+    assert.deepEqual(data.stages.map(stage => stage.id), ["models"]);
+    assert.equal(data.stages[0].ok, false);
+    assert.match(data.error, /invalid key/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("desktop doctor returns findings together with operation stages", () => {
+  const result = spawnSync(process.execPath, ["desktop/bridge.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: { ...process.env, PI_CODING_AGENT_DIR: dir },
+    input: JSON.stringify({ action: "doctor", payload: { probe: false } }),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const data = JSON.parse(result.stdout).data;
+  assert.ok(Array.isArray(data.findings));
+  assert.deepEqual(data.stages.map(stage => stage.id), ["local"]);
+  assert.equal(data.probed, false);
 });
