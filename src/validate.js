@@ -20,6 +20,7 @@ import { API_TYPES } from "./api-types.js";
 /** Cost keys pi requires as a set: partial cost objects fail the schema. */
 const COST_KEYS = ["input", "output", "cacheRead", "cacheWrite"];
 const INPUT_MODALITIES = ["text", "image"];
+const CAPABILITY_CONFIDENCES = ["confirmed", "inferred", "unknown"];
 
 class ValidationError extends Error {}
 
@@ -72,6 +73,22 @@ export function validateModel(model, path = "model") {
       fail(`${path}.cost`, `needs all of ${COST_KEYS.join(", ")} as numbers (missing or non-numeric: ${missing.join(", ")})`);
     }
   }
+  if (model.capabilities !== undefined) {
+    if (!model.capabilities || typeof model.capabilities !== "object" || Array.isArray(model.capabilities)) {
+      fail(`${path}.capabilities`, "must be an object");
+    }
+    for (const key of ["input", "reasoning", "contextWindow"]) {
+      const entry = model.capabilities[key];
+      if (entry === undefined) continue;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        fail(`${path}.capabilities.${key}`, "must be an object");
+      }
+      if (!CAPABILITY_CONFIDENCES.includes(entry.confidence)) {
+        fail(`${path}.capabilities.${key}.confidence`, `must be one of ${CAPABILITY_CONFIDENCES.join(", ")}`);
+      }
+      checkOptionalString(entry.source, `${path}.capabilities.${key}.source`);
+    }
+  }
   return model;
 }
 
@@ -84,8 +101,8 @@ export function validateModel(model, path = "model") {
  */
 export function validateProvider(name, provider, path = `providers.${name}`) {
   if (!name || typeof name !== "string") fail("provider name", "is required");
-  if (/[^A-Za-z0-9_.-]/.test(name)) {
-    fail("provider name", `"${name}" has characters outside letters, digits, . _ -`);
+  if (/[^\p{L}\p{N}_.-]/u.test(name)) {
+    fail("provider name", `"${name}" may only contain Unicode letters, numbers, . _ -`);
   }
   if (!provider || typeof provider !== "object") fail(path, "must be an object");
 

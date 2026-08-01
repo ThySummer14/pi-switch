@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { paths, untildify } from "./paths.js";
 
 export function loadProfileConfig(file = paths.profiles) {
@@ -23,18 +23,42 @@ export function loadProfileConfig(file = paths.profiles) {
   return config;
 }
 
-export function listProfiles({ file = paths.profiles, currentCwd = process.cwd() } = {}) {
+export function listProfiles({ file = paths.profiles, currentCwd = process.cwd(), useDesktopCwd = false } = {}) {
   const config = loadProfileConfig(file);
   return Object.entries(config.profiles).map(([name, spec]) => {
     if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
       throw new Error(`profile "${name}" must be an object`);
     }
-    const cwd = spec.cwd ? resolve(untildify(spec.cwd)) : resolve(currentCwd);
+    if (spec.retryStallTimeoutMs !== undefined
+      && (!Number.isInteger(spec.retryStallTimeoutMs) || spec.retryStallTimeoutMs < 0)) {
+      throw new Error(`profile "${name}" retryStallTimeoutMs must be a non-negative integer`);
+    }
+    if (spec.desktopCwd !== undefined
+      && (typeof spec.desktopCwd !== "string" || !spec.desktopCwd.trim())) {
+      throw new Error(`profile "${name}" desktopCwd must be a non-empty string`);
+    }
+    if (spec.cwd && spec.desktopCwd) {
+      throw new Error(`profile "${name}" cannot define both cwd and desktopCwd`);
+    }
+    const desktopCwd = spec.desktopCwd ? untildify(spec.desktopCwd) : null;
+    if (desktopCwd && !isAbsolute(desktopCwd)) {
+      throw new Error(`profile "${name}" desktopCwd must be absolute or start with ~`);
+    }
+    const preferDesktopCwd = useDesktopCwd && !spec.cwd && desktopCwd;
+    const cwd = spec.cwd
+      ? resolve(untildify(spec.cwd))
+      : preferDesktopCwd
+        ? resolve(desktopCwd)
+        : resolve(currentCwd);
     return {
       name,
       label: spec.label ?? name,
       mode: spec.mode ?? name,
       cwd,
+      cwdSource: spec.cwd ? "profile" : preferDesktopCwd ? "desktop" : "caller",
+      desktopCwd: desktopCwd ? resolve(desktopCwd) : null,
+      desktopCwdExists: desktopCwd ? existsSync(desktopCwd) : null,
+      retryStallTimeoutMs: spec.retryStallTimeoutMs,
       fixedCwd: Boolean(spec.cwd),
       exists: existsSync(cwd),
       isDefault: name === config.defaultProfile,
@@ -57,5 +81,14 @@ export function resolveProfile(name, options = {}) {
 }
 
 export function buildProfileArgs(profile, extraArgs = []) {
-  return ["--mode-start", profile.mode, ...extraArgs];
+  const retryArgs = profile.retryStallTimeoutMs === undefined
+    ? []
+    : ["--retry-stall-timeout-ms", String(profile.retryStallTimeoutMs)];
+  return ["--mode-start", profile.mode, ...retryArgs, ...extraArgs];
+}
+
+export function profileEnvironment(profile) {
+  return profile.retryStallTimeoutMs === undefined
+    ? {}
+    : { PI_RETRY_STALL_TIMEOUT_MS: String(profile.retryStallTimeoutMs) };
 }

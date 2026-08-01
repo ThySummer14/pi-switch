@@ -7,10 +7,12 @@ import { runDoctor } from "./doctor.js";
 import { ccSwitchAvailable, planImportNames, readCcSwitchProviders } from "./import-ccswitch.js";
 import { keychainSpec, parseKeychainSpec, serviceNameFor, setKey } from "./keychain.js";
 import { listServers, setDisabled } from "./mcp.js";
+import { createModelDefaults, inferModelContextWindow, inspectModelCapabilities } from "./model-capabilities.js";
 import { paths, tildify } from "./paths.js";
 import {
   API_TYPES, deleteModel, deleteProvider, diffModels, listProviders,
-  patchProvider, probeProvider, setDefault, setThinking, THINKING_LEVELS, upsertModel, upsertProvider,
+  patchProvider, planModelCapabilityRefresh, probeProvider, refreshModelCapabilities,
+  setDefault, setThinking, THINKING_LEVELS, upsertModel, upsertProvider,
 } from "./providers.js";
 import { listAgents } from "./agents.js";
 import { addSkillPath, listSkillPaths, pruneSkillPaths, removeSkillPath } from "./skills.js";
@@ -322,15 +324,7 @@ async function addProvider(state) {
     api: answers.api,
     apiKey,
     ...(answers.api === "anthropic-messages" ? { authHeader: true } : {}),
-    models: [{
-      id: answers.modelId,
-      name: `${answers.modelId} (${answers.providerName})`,
-      contextWindow: 200_000,
-      maxTokens: 32_768,
-      input: ["text"],
-      reasoning: false,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }],
+    models: [createModelDefaults(answers.modelId, answers.providerName, { api: answers.api })],
   });
   refresh(state);
   return ok(state, `added provider "${answers.providerName}" — press t to test it`);
@@ -402,8 +396,13 @@ async function syncModels(state, row) {
     return;
   }
   const diff = diffModels(row.models, result.models);
+  const capabilityUpdates = planModelCapabilityRefresh(row.name, result.modelDetails);
+  const capabilityRefresh = refreshModelCapabilities(row.name, result.modelDetails);
   const fallback = result.attempts > 1 ? ` via ${new URL(result.url).pathname}` : "";
-  if (diff.extra.length === 0) return ok(state, `${row.name}: nothing new — ${result.models.length} models listed${fallback}`);
+  if (diff.extra.length === 0) {
+    refresh(state);
+    return ok(state, `${row.name}: ${result.models.length} models listed${fallback}${capabilityRefresh.changed.length ? `，已刷新 ${capabilityRefresh.changed.length} 个模型的服务端能力` : "，没有新的模型或能力声明"}`);
+  }
 
   const chosen = await inCooked(state, async () => {
     out(`\n${paint(`${row.name} lists ${diff.extra.length} model(s) not in models.json:`, color.bold)}\n`);
@@ -417,16 +416,21 @@ async function syncModels(state, row) {
       .map(s => diff.extra[Number(s.trim()) - 1])
       .filter(Boolean);
   });
-  if (!chosen || chosen.length === 0) return info(state, "nothing added");
+  if (!chosen || chosen.length === 0) {
+    refresh(state);
+    return info(state, capabilityRefresh.changed.length ? `nothing added；已刷新 ${capabilityRefresh.changed.length} 个模型的服务端能力` : "nothing added");
+  }
+  const details = new Map((result.modelDetails || []).map(item => [item.id, item]));
   for (const id of chosen) {
     upsertModel(row.name, {
       id,
       name: `${id} (${row.name})`,
+      capabilitySource: details.get(id),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     });
   }
   refresh(state);
-  return ok(state, `added ${chosen.length} model(s) to ${row.name}${fallback} — set contextWindow/reasoning by hand if the defaults are wrong`);
+  return ok(state, `added ${chosen.length} model(s) to ${row.name}${fallback}${capabilityUpdates.length ? `；已刷新 ${capabilityRefresh.changed.length} 个已有模型的服务端能力` : ""} — review unknown capability hints before using images or reasoning`);
 }
 
 async function importFromCcSwitch(state) {
@@ -497,7 +501,8 @@ async function addModel(state) {
     out(`\n${paint(`new model under ${providerName}`, color.bold)}\n`);
     const id = await prompt("model id");
     if (!id) return null;
-    const contextWindow = await prompt("contextWindow", { defaultValue: "200000" });
+    const contextGuess = inferModelContextWindow(id);
+    const contextWindow = await prompt("contextWindow", { defaultValue: String(contextGuess.contextWindow) });
     if (contextWindow === null) return null;
     const maxTokens = await prompt("maxTokens", { defaultValue: "32768" });
     if (maxTokens === null) return null;
@@ -518,7 +523,8 @@ async function editModel(state, row) {
   if (!row) return;
   const answers = await inCooked(state, async () => {
     out(`\n${paint(`edit ${row.provider}/${row.id}`, color.bold)}\n`);
-    const contextWindow = await prompt("contextWindow", { defaultValue: String(row.contextWindow ?? 200000) });
+    const contextGuess = inferModelContextWindow(row.id);
+    const contextWindow = await prompt("contextWindow", { defaultValue: String(row.contextWindow ?? contextGuess.contextWindow) });
     if (contextWindow === null) return null;
     const maxTokens = await prompt("maxTokens", { defaultValue: String(row.maxTokens ?? 32768) });
     if (maxTokens === null) return null;
@@ -812,14 +818,23 @@ function renderModels(state, cols) {
   for (const [i, m] of state.rows.entries()) {
     const isActive = state.settings?.defaultProvider === m.provider && state.settings?.defaultModel === m.id;
     const mark = isActive ? paint(glyph.on, color.green) : paint(glyph.off, color.grey);
+    const capabilities = inspectModelCapabilities(m);
+    const reasoning = capabilities.reasoningConfidence === "unknown"
+      ? paint("?", color.yellow)
+      : capabilities.reasoning
+        ? paint("yes", color.green)
+        : paint("no", color.grey);
+    const input = capabilities.inputConfidence === "unknown"
+      ? paint(`${(m.input || []).join(",")} ?`, color.yellow)
+      : paint((m.input || []).join(","), color.grey);
     const row =
       cursorMark(state, i) +
       `${mark} ` +
       pad(paint(truncate(m.id, 29), isActive ? color.bold : color.reset), 30) +
-      pad(fmtNum(m.contextWindow), 12) +
+      pad(fmtNum(capabilities.contextWindow) + (capabilities.contextWindowConfidence === "unknown" ? "?" : ""), 12) +
       pad(fmtNum(m.maxTokens), 12) +
-      pad(m.reasoning ? paint("yes", color.green) : paint("no", color.grey), 11) +
-      paint((m.input || []).join(","), color.grey);
+      pad(reasoning, 11) +
+      input;
     lines.push(truncate(row, cols));
   }
   return { header, listRows: lines };
@@ -861,12 +876,19 @@ function renderSkills(state, cols) {
   ];
   const lines = [];
   for (const [i, r] of state.rows.entries()) {
-    const mark = r.exists ? (r.count > 0 ? paint(glyph.ok, color.green) : paint(glyph.warn, color.yellow)) : paint(glyph.bad, color.red);
+    const excluded = r.kind === "exclude";
+    const mark = excluded
+      ? paint(glyph.off, color.grey)
+      : r.exists
+        ? (r.count > 0 ? paint(glyph.ok, color.green) : paint(glyph.warn, color.yellow))
+        : paint(glyph.bad, color.red);
+    const count = excluded ? "-" : String(r.count);
+    const kind = r.selector === "include" ? "include" : r.kind;
     const row =
       cursorMark(state, i) +
       `${mark} ` +
-      pad(String(r.count), 8) +
-      pad(paint(r.kind, color.grey), 9) +
+      pad(count, 8) +
+      pad(paint(kind, color.grey), 9) +
       (r.exists ? r.entry : paint(r.entry, color.red));
     lines.push(truncate(row, cols));
   }

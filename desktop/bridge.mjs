@@ -15,6 +15,9 @@ const profiles = await fromCore("profiles.js");
 const doctor = await fromCore("doctor.js");
 const keychain = await fromCore("keychain.js");
 const importer = await fromCore("import-ccswitch.js");
+const transfer = await fromCore("config-transfer.js");
+const providerCatalog = await fromCore("provider-catalog.js");
+const { createModelDefaults } = await fromCore("model-capabilities.js");
 const { spawn } = await import("node:child_process");
 
 function publicProvider(row) {
@@ -33,14 +36,35 @@ function publicProvider(row) {
   };
 }
 
+function keyStorageKind(spec) {
+  if (typeof spec !== "string" || !spec) return "missing";
+  if (spec.startsWith("!")) return "command";
+  if (spec.startsWith("$")) return "environment";
+  return "inline";
+}
+
+function publicProviderMutation(name, provider) {
+  return {
+    name,
+    api: provider.api,
+    baseUrl: provider.baseUrl,
+    modelCount: provider.models?.length || 0,
+    keyStorage: keyStorageKind(provider.apiKey),
+  };
+}
+
 function dashboard() {
   const settings = store.loadSettings();
+  const catalog = providerCatalog.getProviderCatalog();
   let profileRows = [];
   try {
-    profileRows = profiles.listProfiles();
+    profileRows = profiles.listProfiles({ currentCwd: homedir(), useDesktopCwd: true });
   } catch {
     // Doctor reports the concrete profile config error.
   }
+  const workspaceCwd = profileRows.find(profile => profile.isDefault)?.cwd
+    || profileRows[0]?.cwd
+    || homedir();
   return {
     providers: providers.listProviders().map(publicProvider),
     settings: {
@@ -48,28 +72,23 @@ function dashboard() {
       defaultModel: settings.defaultModel,
       defaultThinkingLevel: settings.defaultThinkingLevel,
     },
-    mcp: mcp.listServers().map(({ env, ...row }) => row),
+    mcp: mcp.listServers(workspaceCwd).map(({ env, ...row }) => row),
     skillPaths: skills.listSkillPaths(),
     skillCatalog: skills.listSkills(),
-    agents: agents.listAgents(),
+    agents: agents.listAgents(workspaceCwd),
     profiles: profileRows,
+    workspaceCwd,
     apiTypes: providers.API_TYPES,
     thinkingLevels: providers.THINKING_LEVELS,
+    providerPresets: catalog.presets,
+    providerCatalog: catalog.status,
+    keychainAvailable: process.platform === "darwin",
     ccSwitchAvailable: importer.ccSwitchAvailable(),
   };
 }
 
 function modelDefaults(id, providerName, patch = {}) {
-  return {
-    id,
-    name: `${id} (${providerName})`,
-    contextWindow: 200_000,
-    maxTokens: 32_768,
-    input: ["text"],
-    reasoning: false,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    ...patch,
-  };
+  return createModelDefaults(id, providerName, patch);
 }
 
 function piBinary() {
@@ -88,7 +107,7 @@ function cleanProbeError(stdout, stderr, secret) {
   return text.slice(-2_000) || "Pi 未返回具体错误";
 }
 
-function testProviderWithPi(row, { timeoutMs = 30_000 } = {}) {
+function runPiPrint(row, { timeoutMs = 30_000 } = {}) {
   const model = row.defaultModel || row.models[0];
   if (!model) return Promise.resolve({ ok: false, ms: 0, error: "这个 Provider 尚未配置模型" });
   const secret = store.resolveApiKey(row.apiKeySpec).value;
@@ -133,10 +152,92 @@ function testProviderWithPi(row, { timeoutMs = 30_000 } = {}) {
   });
 }
 
+async function testProviderWithPi(row, { timeoutMs = 30_000 } = {}) {
+  const result = await runPiPrint(row, { timeoutMs });
+  const chatStage = {
+    id: "chat",
+    label: "真实对话",
+    ok: result.ok,
+    ms: result.ms,
+    detail: result.ok ? "模型返回成功" : result.error,
+  };
+  if (!result.ok) return { ...result, stages: [chatStage] };
+
+  // A successful chat proves the configured model works. The model-list probe
+  // is supplementary: several compatible gateways intentionally do not expose
+  // /models, so its failure must never turn a real connection into a failure.
+  try {
+    const modelProbeStarted = Date.now();
+    const listed = await providers.probeProvider(row.raw, { timeoutMs: 5_000 });
+    if (!listed.ok) {
+      return {
+        ...result,
+        stages: [
+          chatStage,
+          {
+            id: "models",
+            label: "模型列表",
+            ok: false,
+            ms: listed.ms ?? Date.now() - modelProbeStarted,
+            detail: listed.error || "服务端没有返回模型列表",
+          },
+        ],
+        modelCheck: { ok: false, status: listed.status, error: listed.error },
+      };
+    }
+    return {
+      ...result,
+      stages: [
+        chatStage,
+        {
+          id: "models",
+          label: "模型列表",
+          ok: true,
+          ms: listed.ms ?? Date.now() - modelProbeStarted,
+          detail: `返回 ${listed.models.length} 个模型`,
+        },
+      ],
+      modelCheck: { ok: true, status: listed.status, ms: listed.ms, modelCount: listed.models.length },
+      diff: providers.diffModels(row.models, listed.models),
+    };
+  } catch (error) {
+    return {
+      ...result,
+      stages: [
+        chatStage,
+        { id: "models", label: "模型列表", ok: false, ms: 0, detail: error?.message || String(error) },
+      ],
+      modelCheck: { ok: false, error: error?.message || String(error) },
+    };
+  }
+}
+
 async function execute(action, payload = {}) {
   switch (action) {
     case "dashboard":
       return dashboard();
+    case "syncProviderCatalog":
+      return providerCatalog.syncProviderCatalog();
+    case "resetProviderCatalog":
+      return providerCatalog.resetProviderCatalog();
+    case "exportConfig":
+      return transfer.exportConfig(store.loadModels(), store.loadSettings());
+    case "previewRestore":
+      return transfer.planRestoreConfig(store.loadModels(), store.loadSettings(), payload.config).summary;
+    case "restoreConfig": {
+      let summary;
+      store.updateModels(currentModels => {
+        const planned = transfer.planRestoreConfig(currentModels, store.loadSettings(), payload.config);
+        summary = planned.summary;
+        return planned.nextModels;
+      });
+      store.updateSettings(currentSettings => {
+        const planned = transfer.planRestoreConfig(store.loadModels(), currentSettings, payload.config);
+        summary = planned.summary;
+        return planned.nextSettings;
+      });
+      return summary;
+    }
     case "activateProvider":
       return providers.setDefault(payload.provider, payload.model);
     case "setThinking":
@@ -156,22 +257,30 @@ async function execute(action, payload = {}) {
     case "addProvider": {
       const { name, baseUrl, api, key, model, storeKeychain } = payload;
       if (!key) throw new Error("API key is required");
+      if (providers.getProvider(name)) throw new Error(`provider "${name}" already exists`);
       let apiKey = key;
       if (storeKeychain && process.platform === "darwin") {
         const service = keychain.serviceNameFor(name);
         keychain.setKey(service, key);
         apiKey = keychain.keychainSpec(service);
       }
-      return providers.upsertProvider(name, {
+      const config = {
         baseUrl: baseUrl.replace(/\/+$/, ""),
         api,
         apiKey,
         ...(api === "anthropic-messages" ? { authHeader: true } : {}),
-        models: [modelDefaults(model, name)],
-      });
+        models: [modelDefaults(model, name, { api })],
+      };
+      const saved = providers.upsertProvider(name, config);
+      return publicProviderMutation(name, saved);
     }
+    case "duplicateProvider":
+      return providers.duplicateProvider(payload.source, payload.name);
     case "updateProvider":
-      return providers.patchProvider(payload.name, { baseUrl: payload.baseUrl.replace(/\/+$/, ""), api: payload.api });
+      return publicProviderMutation(
+        payload.name,
+        providers.patchProvider(payload.name, { baseUrl: payload.baseUrl.replace(/\/+$/, ""), api: payload.api }),
+      );
     case "rotateKey": {
       const row = providers.listProviders().find(item => item.name === payload.name);
       if (!row) throw new Error(`provider "${payload.name}" not found`);
@@ -190,12 +299,12 @@ async function execute(action, payload = {}) {
       providers.deleteProvider(payload.name);
       return true;
     case "upsertModel": {
-      const exists = (providers.getProvider(payload.provider)?.models || []).some(model => model.id === payload.model.id);
-      return providers.upsertModel(
-        payload.provider,
-        exists ? payload.model : modelDefaults(payload.model.id, payload.provider, payload.model),
-      );
+      return providers.upsertModel(payload.provider, payload.model);
     }
+    case "batchUpdateModels":
+      return providers.batchUpdateModels(payload.provider, payload.ids, payload.patch);
+    case "repairModelCapabilities":
+      return providers.repairModelCapabilities(payload.provider, payload.model);
     case "deleteModel":
       providers.deleteModel(payload.provider, payload.id);
       return true;
@@ -205,13 +314,37 @@ async function execute(action, payload = {}) {
       const result = await providers.probeProvider(row.raw);
       if (!result.ok) throw new Error(result.error);
       const diff = providers.diffModels(row.models, result.models);
+      const capabilityUpdates = providers.planModelCapabilityRefresh(row.name, result.modelDetails);
+      let capabilityRefresh = { provider: row.name, changed: [] };
       if (payload.apply) {
-        for (const id of diff.extra) providers.upsertModel(row.name, modelDefaults(id, row.name));
+        capabilityRefresh = providers.refreshModelCapabilities(row.name, result.modelDetails);
+        const details = new Map((result.modelDetails || []).map(item => [item.id, item]));
+        for (const id of diff.extra) {
+          const detail = details.get(id);
+          providers.upsertModel(row.name, {
+            id,
+            name: `${id} (${row.name})`,
+            capabilitySource: detail,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          });
+        }
       }
-      return { ...result, diff };
+      return { ...result, diff, capabilityUpdates, capabilityRefresh };
     }
     case "toggleMcp":
-      return mcp.setDisabled(payload.name, payload.disabled, { scope: payload.scope || "global" });
+      return mcp.setDisabled(payload.name, payload.disabled, { scope: payload.scope || "global", cwd: payload.cwd || process.cwd() });
+    case "upsertMcp": {
+      const patch = {
+        ...(payload.command !== undefined ? { command: payload.command } : {}),
+        ...(payload.args !== undefined ? { args: payload.args } : {}),
+        ...(payload.url !== undefined ? { url: payload.url } : {}),
+        ...(payload.lifecycle !== undefined ? { lifecycle: payload.lifecycle } : {}),
+        ...(payload.env !== undefined ? { env: payload.env } : {}),
+      };
+      return mcp.upsertServer(payload.name, patch, { scope: payload.scope || "global", cwd: payload.cwd || process.cwd() });
+    }
+    case "deleteMcp":
+      return mcp.deleteServer(payload.name, { scope: payload.scope || "global", cwd: payload.cwd || process.cwd() });
     case "addSkillPath":
       return skills.addSkillPath(payload.path);
     case "removeSkillPath":
@@ -234,12 +367,30 @@ async function execute(action, payload = {}) {
     case "importAll": {
       const rows = importer.readCcSwitchProviders().filter(row => row.converted);
       const plan = importer.planImportNames(rows, providers.listProviders().map(row => row.name));
-      for (const { row, name } of plan) providers.upsertProvider(name, row.converted);
-      return { count: plan.length };
+      const useKeychain = payload.storeKeychain === true && process.platform === "darwin";
+      let keychainCount = 0;
+      let plaintextCount = 0;
+      for (const { row, name } of plan) {
+        const converted = structuredClone(row.converted);
+        if (useKeychain && converted.apiKey) {
+          const service = keychain.serviceNameFor(name);
+          keychain.setKey(service, converted.apiKey);
+          converted.apiKey = keychain.keychainSpec(service);
+          keychainCount += 1;
+        } else {
+          plaintextCount += 1;
+        }
+        providers.upsertProvider(name, converted);
+      }
+      return { count: plan.length, keychainCount, plaintextCount };
     }
     case "launchProfile": {
-      const profile = profiles.resolveProfile(payload.name);
-      const command = `cd ${shellQuote(profile.cwd)} && pi --mode-start ${shellQuote(profile.mode)}`;
+      const profile = profiles.resolveProfile(payload.name, { currentCwd: homedir(), useDesktopCwd: true });
+      const piArgs = profiles.buildProfileArgs(profile);
+      const profileEnv = profiles.profileEnvironment(profile);
+      const envArgs = Object.entries(profileEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
+      const envPrefix = envArgs.length > 0 ? `env ${envArgs.join(" ")} ` : "";
+      const command = `cd ${shellQuote(profile.cwd)} && ${envPrefix}pi ${piArgs.map(shellQuote).join(" ")}`;
       const script = `tell application "Terminal" to do script ${JSON.stringify(command)}`;
       const child = spawn("/usr/bin/osascript", ["-e", script], { detached: true, stdio: "ignore" });
       child.unref();

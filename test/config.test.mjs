@@ -89,7 +89,39 @@ test("the active default model cannot be deleted", () => {
 test("upsertProvider validates the api name and requires a baseUrl", () => {
   assert.throws(() => providers.upsertProvider("x", { api: "made-up", baseUrl: "https://x" }), /is not an api pi implements/);
   assert.throws(() => providers.upsertProvider("x", { api: "openai-completions" }), /baseUrl is required/);
-  assert.throws(() => providers.upsertProvider("bad name", { api: "openai-completions", baseUrl: "https://x" }), /outside letters, digits/);
+  assert.throws(() => providers.upsertProvider("bad name", { api: "openai-completions", baseUrl: "https://x" }), /may only contain Unicode letters/);
+  assert.throws(() => providers.upsertProvider("bad/name", { api: "openai-completions", baseUrl: "https://x" }), /may only contain Unicode letters/);
+});
+
+test("provider names support Chinese and other Unicode letters", () => {
+  const config = {
+    api: "openai-completions",
+    baseUrl: "https://unicode.example/v1",
+    apiKey: "test-key",
+    models: [{ id: "m1" }],
+  };
+  providers.upsertProvider("米醋中转", config);
+  assert.deepEqual(providers.getProvider("米醋中转"), config);
+});
+
+test("duplicateProvider copies models and key references without resolving the key", () => {
+  const source = providers.getProvider("relay");
+  const result = providers.duplicateProvider("relay", "relay-副本");
+  assert.deepEqual(result, {
+    source: "relay",
+    name: "relay-副本",
+    api: "anthropic-messages",
+    modelCount: source.models.length,
+    keyStorage: "inline",
+  });
+
+  const copy = providers.getProvider("relay-副本");
+  assert.notEqual(copy, source);
+  assert.deepEqual(copy.models, source.models);
+  assert.equal(copy.apiKey, source.apiKey);
+  assert.throws(() => providers.duplicateProvider("relay", "relay-副本"), /already exists/);
+  assert.throws(() => providers.duplicateProvider("relay", "bad name"), /may only contain Unicode letters/);
+  assert.throws(() => providers.duplicateProvider("relay", "relay"), /different name/);
 });
 
 test("a provider that pi's schema would reject is never written", () => {
@@ -143,6 +175,57 @@ test("upsertModel fills conservative defaults and merges on re-add", () => {
   const merged = providers.getProvider("relay").models.find(m => m.id === "new-model");
   assert.equal(merged.reasoning, true);
   assert.equal(merged.contextWindow, 200_000, "unspecified fields survive the merge");
+});
+
+test("batchUpdateModels changes only explicit fields and locks those capabilities", () => {
+  providers.upsertProvider("batch", {
+    baseUrl: "https://batch.example",
+    api: "openai-completions",
+    apiKey: "test-key",
+    models: [
+      { id: "one", contextWindow: 100_000, maxTokens: 8_000, input: ["text"], reasoning: false, capabilities: { input: { confidence: "inferred", source: "catalog" }, reasoning: { confidence: "unknown", source: "unknown" }, contextWindow: { confidence: "inferred", source: "catalog" } } },
+      { id: "two", contextWindow: 200_000, maxTokens: 16_000, input: ["text"], reasoning: false, capabilities: { input: { confidence: "inferred", source: "catalog" }, reasoning: { confidence: "unknown", source: "unknown" }, contextWindow: { confidence: "inferred", source: "catalog" } } },
+      { id: "untouched", contextWindow: 300_000, maxTokens: 32_000, input: ["text"], reasoning: false },
+    ],
+  });
+
+  const result = providers.batchUpdateModels("batch", ["one", "two", "one"], {
+    contextWindow: 500_000,
+    maxTokens: 24_000,
+    input: ["text", "image"],
+    reasoning: true,
+  });
+  assert.deepEqual(result, {
+    provider: "batch",
+    updated: ["one", "two"],
+    fields: ["contextWindow", "maxTokens", "input", "reasoning"],
+  });
+
+  const rows = providers.getProvider("batch").models;
+  for (const id of ["one", "two"]) {
+    const model = rows.find(row => row.id === id);
+    assert.equal(model.contextWindow, 500_000);
+    assert.equal(model.maxTokens, 24_000);
+    assert.deepEqual(model.input, ["text", "image"]);
+    assert.equal(model.reasoning, true);
+    assert.deepEqual(model.capabilities.input, { confidence: "confirmed", source: "manual" });
+    assert.deepEqual(model.capabilities.reasoning, { confidence: "confirmed", source: "manual" });
+    assert.deepEqual(model.capabilities.contextWindow, { confidence: "confirmed", source: "manual" });
+  }
+  assert.equal(rows.find(row => row.id === "untouched").contextWindow, 300_000);
+
+  const beforeMaxOnly = structuredClone(rows.find(row => row.id === "one").capabilities);
+  providers.batchUpdateModels("batch", ["one"], { maxTokens: 25_000 });
+  const afterMaxOnly = providers.getProvider("batch").models.find(row => row.id === "one");
+  assert.equal(afterMaxOnly.maxTokens, 25_000);
+  assert.deepEqual(afterMaxOnly.capabilities, beforeMaxOnly, "a maximum-output-only batch leaves capability evidence intact");
+
+  const beforeInvalidEdit = readFileSync(join(dir, "models.json"), "utf8");
+  assert.throws(
+    () => providers.batchUpdateModels("batch", ["one", "missing"], { reasoning: false }),
+    /model\(s\) not found/,
+  );
+  assert.equal(readFileSync(join(dir, "models.json"), "utf8"), beforeInvalidEdit, "a rejected batch does not write a partial update");
 });
 
 test("diffModels finds configured ids the endpoint does not offer", () => {
@@ -233,6 +316,47 @@ test("MCP toggling writes a pi-owned layer and never edits the shared config", (
   assert.deepEqual(store.readJson(join(dir, ".pi", "mcp.json")).mcpServers.ctx, { disabled: true });
 
   assert.throws(() => mcp.setDisabled("ghost", true, { cwd: dir }), /not defined in any config layer/);
+});
+
+test("MCP CRUD writes only a pi-owned override and never copies shared secrets", () => {
+  const sharedBody = JSON.stringify({ mcpServers: {
+    remote: { command: "npx", args: ["remote-server"], env: { TOKEN: "shared-secret" }, lifecycle: "lazy" },
+    readonly: { command: "npx", args: ["readonly-server"] },
+  } });
+  // Use the project's shared layer for this isolated fixture.
+  const cwd = dir;
+  writeFileSync(join(cwd, ".mcp.json"), sharedBody);
+
+  const added = mcp.upsertServer("local", {
+    command: "node",
+    args: ["server.mjs"],
+    env: { API_KEY: "local-secret" },
+    lifecycle: "eager",
+  }, { scope: "project", cwd });
+  assert.equal(added.action, "added");
+  assert.deepEqual(store.readJson(join(cwd, ".pi", "mcp.json")).mcpServers.local, {
+    command: "node",
+    args: ["server.mjs"],
+    env: { API_KEY: "local-secret" },
+    lifecycle: "eager",
+  });
+
+  mcp.upsertServer("local", { url: "https://mcp.example/sse" }, { scope: "project", cwd });
+  assert.deepEqual(store.readJson(join(cwd, ".pi", "mcp.json")).mcpServers.local, {
+    url: "https://mcp.example/sse",
+    lifecycle: "eager",
+    env: { API_KEY: "local-secret" },
+  });
+
+  const updated = mcp.upsertServer("remote", { lifecycle: "eager" }, { scope: "project", cwd });
+  assert.equal(updated.action, "updated");
+  const override = store.readJson(join(cwd, ".pi", "mcp.json")).mcpServers.remote;
+  assert.deepEqual(override, { lifecycle: "eager" });
+  assert.equal(readFileSync(join(cwd, ".mcp.json"), "utf-8"), sharedBody);
+  assert.deepEqual(mcp.listServers(cwd).find(row => row.name === "remote").envKeys, ["TOKEN"]);
+
+  assert.equal(mcp.deleteServer("local", { scope: "project", cwd }).action, "deleted");
+  assert.throws(() => mcp.deleteServer("readonly", { scope: "project", cwd }), /shared config is read-only/);
 });
 
 test("writeJson leaves no temp file behind", () => {

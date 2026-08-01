@@ -6,6 +6,8 @@
 import { existsSync } from "node:fs";
 import { agentDirStatus, listAgents, unreachableAgentFiles } from "./agents.js";
 import { listServers } from "./mcp.js";
+import { inferModelCapabilities, inspectModelCapabilities } from "./model-capabilities.js";
+import { repairCommand, runMaintenanceChecks } from "./maintenance.js";
 import { paths, tildify } from "./paths.js";
 import { listProfiles } from "./profiles.js";
 import { listProviders, probeProvider, diffModels } from "./providers.js";
@@ -32,11 +34,50 @@ export async function runDoctor({ probe = false, cwd = process.cwd() } = {}) {
   if (!modelsInvalid) findings.push(...checkDefaults());
   findings.push(...checkProfiles());
   if (!modelsInvalid) findings.push(...checkProviderKeys());
+  if (!modelsInvalid) findings.push(...checkModelCapabilities());
   if (!modelsInvalid) findings.push(...checkAgents(cwd));
   findings.push(...checkSkills());
   findings.push(...checkMcp(cwd));
+  findings.push(...checkMaintenance());
   if (probe && !modelsInvalid) findings.push(...(await checkReachability()));
   return findings;
+}
+
+function checkMaintenance() {
+  let checks;
+  try {
+    checks = runMaintenanceChecks();
+  } catch (error) {
+    return [finding("error", "maintenance", error.message, tildify(paths.maintenanceChecks))];
+  }
+
+  return checks.map((check) => {
+    if (check.status === "ok") {
+      return finding("ok", "maintenance", `${check.label}: applied`);
+    }
+    if (check.status === "missing") {
+      return finding(
+        "error",
+        "maintenance",
+        `${check.label}: local patch is not applied`,
+        repairCommand(check.script),
+      );
+    }
+    if (check.status === "incompatible") {
+      return finding(
+        "error",
+        "maintenance",
+        `${check.label}: upstream source is incompatible; automatic repair is disabled`,
+        `inspect ${tildify(check.script)} and the upgraded package before changing anything`,
+      );
+    }
+    return finding(
+      "error",
+      "maintenance",
+      `${check.label}: ${check.reason ?? "check failed unexpectedly"}`,
+      tildify(check.script),
+    );
+  });
 }
 
 function checkProfiles() {
@@ -54,6 +95,9 @@ function checkProfiles() {
   for (const profile of profiles) {
     if (!profile.exists) {
       out.push(finding("error", "profiles", `${profile.name}: cwd does not exist`, profile.cwd));
+    }
+    if (profile.desktopCwd && !profile.desktopCwdExists) {
+      out.push(finding("error", "profiles", `${profile.name}: desktopCwd does not exist`, profile.desktopCwd));
     }
   }
   if (out.length === 0) {
@@ -131,6 +175,73 @@ function checkProviderKeys() {
   return out;
 }
 
+function sameInput(left, right) {
+  return Array.isArray(left) && Array.isArray(right) &&
+    left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+/**
+ * Detect legacy rows that silently turned unknown capabilities into false/text.
+ * This is a warning rather than an error: Pi still has a valid model entry, but
+ * the user should confirm the upstream behavior before sending images or
+ * enabling a thinking level.
+ */
+function checkModelCapabilities() {
+  const out = [];
+  for (const provider of listProviders()) {
+    for (const model of provider.modelObjects || []) {
+      const actual = inspectModelCapabilities(model);
+      const inferred = inferModelCapabilities(model.id, { api: provider.api });
+      const hasEvidence = model.capabilities && typeof model.capabilities === "object";
+      const hasContextEvidence = hasEvidence && model.capabilities.contextWindow;
+      const prefix = `${provider.name}/${model.id}`;
+      if (!hasEvidence && inferred.capabilities.reasoning.confidence === "inferred" && !actual.reasoning) {
+        out.push(finding(
+          "warn",
+          "capability",
+          `${prefix}: reasoning is disabled but the model family is known to support it`,
+          "open 模型页面编辑该模型并确认 Reasoning",
+        ));
+      }
+      if (!hasEvidence && inferred.capabilities.input.confidence === "inferred" &&
+        !sameInput(actual.input, inferred.input)) {
+        out.push(finding(
+          "warn",
+          "capability",
+          `${prefix}: input is ${actual.input.join("+")} but the model family is known to accept images`,
+          "open 模型页面编辑该模型并确认图片输入",
+        ));
+      }
+      if (!hasContextEvidence && inferred.capabilities.contextWindow.confidence === "inferred" &&
+        actual.contextWindow !== inferred.contextWindow) {
+        out.push(finding(
+          "warn",
+          "context",
+          `${prefix}: context window is ${actual.contextWindow} but the model registry lists ${inferred.contextWindow}`,
+          "open 模型页面或运行修复已知能力，确认服务端上下文限制",
+        ));
+      }
+      if (actual.inputConfidence === "unknown" || actual.reasoningConfidence === "unknown") {
+        out.push(finding(
+          "warn",
+          "capability",
+          `${prefix}: capability evidence is unknown (runtime values are ${actual.input.join("+")} / reasoning ${actual.reasoning ? "on" : "off"})`,
+          "open 模型页面确认能力；不要把未知当成服务端明确不支持",
+        ));
+      }
+      if (actual.contextWindowConfidence === "unknown") {
+        out.push(finding(
+          "warn",
+          "context",
+          `${prefix}: context window evidence is unknown (runtime fallback is ${actual.contextWindow})`,
+          "打开模型页面确认服务端上下文窗口，不要把 200K fallback 当成真实上限",
+        ));
+      }
+    }
+  }
+  return out;
+}
+
 function keyFix(p) {
   if (p.keySource?.startsWith("env:")) return `export ${p.keySource.slice(4)}=… in your shell rc`;
   if (p.keySource?.startsWith("cmd:")) return "the key command failed — check the keychain entry exists";
@@ -174,6 +285,7 @@ function checkAgents(cwd) {
 function checkSkills() {
   const out = [];
   for (const row of listSkillPaths()) {
+    if (row.kind === "exclude") continue;
     if (!row.exists) {
       out.push(finding("error", "skills", `settings.skills path does not exist: ${row.entry}`, "pi-switch skills prune"));
       continue;

@@ -1,5 +1,7 @@
 node_modules/
 desktop/dist/
+.playwright-cli/
+output/
 src-tauri/target/
 src-tauri/gen/
 .DS_Store

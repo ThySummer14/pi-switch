@@ -4,6 +4,7 @@
  */
 
 import { API_TYPES } from "./api-types.js";
+import { createModelDefaults, inferModelCapabilities, inferModelTransport, markManualCapabilities } from "./model-capabilities.js";
 import { isInlineKey, loadModels, loadSettings, resolveApiKey, updateModels, updateSettings } from "./store.js";
 import { validateProvider } from "./validate.js";
 
@@ -66,6 +67,46 @@ export function upsertProvider(name, config) {
   return config;
 }
 
+/**
+ * Copy a provider without resolving its credential. The apiKey field is a
+ * reference (environment variable, keychain command, or inline value) and is
+ * deliberately carried over as-is; resolving it here would put a secret in
+ * the bridge response and would make a copy operation unexpectedly access the
+ * keychain.
+ */
+export function duplicateProvider(sourceName, targetName) {
+  const name = typeof targetName === "string" ? targetName.trim() : "";
+  if (!name) throw new Error("target provider name is required");
+  if (name === sourceName) throw new Error("the copied Provider needs a different name");
+
+  let result;
+  updateModels(models => {
+    const source = models.providers[sourceName];
+    if (!source) throw new Error(`provider "${sourceName}" not found`);
+    if (models.providers[name]) throw new Error(`provider "${name}" already exists`);
+
+    const copy = structuredClone(source);
+    validateProvider(name, copy);
+    models.providers[name] = copy;
+    const keySpec = copy.apiKey;
+    const keyStorage = typeof keySpec !== "string" || !keySpec
+      ? "missing"
+      : keySpec.startsWith("!")
+        ? "command"
+        : keySpec.startsWith("$")
+          ? "environment"
+          : "inline";
+    result = {
+      source: sourceName,
+      name,
+      api: copy.api,
+      modelCount: copy.models?.length || 0,
+      keyStorage,
+    };
+  });
+  return result;
+}
+
 /** Patch selected fields of an existing provider. */
 export function patchProvider(name, patch) {
   let next;
@@ -103,18 +144,268 @@ export function upsertModel(providerName, model) {
     if (!provider) throw new Error(`provider "${providerName}" not found`);
     provider.models = provider.models || [];
     const at = provider.models.findIndex(m => m.id === model.id);
-    merged = {
-      contextWindow: 200_000,
-      maxTokens: 32_768,
-      input: ["text"],
-      reasoning: false,
-      ...(at >= 0 ? provider.models[at] : {}),
-      ...model,
-    };
+    const existing = at >= 0 ? provider.models[at] : null;
+    const defaults = existing || createModelDefaults(model.id, providerName, {
+      api: provider.api,
+      capabilitySource: model.capabilitySource ?? model,
+    });
+    merged = { ...defaults, ...model };
+    if (!model.capabilities && (Object.prototype.hasOwnProperty.call(model, "input") ||
+      Object.prototype.hasOwnProperty.call(model, "reasoning") ||
+      Object.prototype.hasOwnProperty.call(model, "contextWindow"))) {
+      merged.capabilities = markManualCapabilities(existing || defaults, model);
+    }
+    delete merged.capabilitySource;
     if (at >= 0) provider.models[at] = merged;
     else provider.models.push(merged);
   });
   return merged;
+}
+
+/**
+ * Apply an explicit set of fields to several existing models in one locked
+ * write. Capability fields become manual locks, while every omitted field and
+ * every unrelated capability declaration is preserved.
+ */
+export function batchUpdateModels(providerName, modelIds, patch = {}) {
+  const ids = [...new Set((Array.isArray(modelIds) ? modelIds : [])
+    .map(id => typeof id === "string" ? id.trim() : "")
+    .filter(Boolean))];
+  if (ids.length === 0) throw new Error("at least one model is required");
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new Error("model patch must be an object");
+  }
+
+  const allowed = new Set(["contextWindow", "maxTokens", "input", "reasoning"]);
+  const fields = Object.keys(patch);
+  const unknown = fields.filter(field => !allowed.has(field));
+  if (unknown.length > 0) throw new Error(`batch model edit cannot change: ${unknown.join(", ")}`);
+  if (fields.length === 0) throw new Error("select at least one field to change");
+
+  const contextWindow = patch.contextWindow;
+  if (Object.prototype.hasOwnProperty.call(patch, "contextWindow") &&
+    (!Number.isSafeInteger(contextWindow) || contextWindow <= 0)) {
+    throw new Error("contextWindow must be a positive integer");
+  }
+  const maxTokens = patch.maxTokens;
+  if (Object.prototype.hasOwnProperty.call(patch, "maxTokens") &&
+    (!Number.isSafeInteger(maxTokens) || maxTokens <= 0)) {
+    throw new Error("maxTokens must be a positive integer");
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "reasoning") && typeof patch.reasoning !== "boolean") {
+    throw new Error("reasoning must be true or false");
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "input")) {
+    if (!Array.isArray(patch.input) || patch.input.length === 0 ||
+      new Set(patch.input).size !== patch.input.length ||
+      patch.input.some(value => value !== "text" && value !== "image") ||
+      !patch.input.includes("text")) {
+      throw new Error('input must be a non-empty list containing "text" and optionally "image"');
+    }
+  }
+
+  let result;
+  updateModels(models => {
+    const provider = models.providers[providerName];
+    if (!provider) throw new Error(`provider "${providerName}" not found`);
+    const modelById = new Map((provider.models || []).map(model => [model.id, model]));
+    const missing = ids.filter(id => !modelById.has(id));
+    if (missing.length > 0) throw new Error(`model(s) not found under provider "${providerName}": ${missing.join(", ")}`);
+
+    for (const id of ids) {
+      const current = modelById.get(id);
+      const next = { ...current, ...patch };
+      if (Object.prototype.hasOwnProperty.call(patch, "input") ||
+        Object.prototype.hasOwnProperty.call(patch, "reasoning") ||
+        Object.prototype.hasOwnProperty.call(patch, "contextWindow")) {
+        next.capabilities = markManualCapabilities(current, patch);
+      }
+      const index = provider.models.indexOf(current);
+      provider.models[index] = next;
+    }
+    result = { provider: providerName, updated: ids, fields: [...fields] };
+  });
+  return result;
+}
+
+/**
+ * Preview capability changes that can be proven by the provider's model list.
+ * A model-list row that only contains an id contributes no evidence, so it is
+ * deliberately ignored. This keeps a sparse `/models` response from silently
+ * rewriting a user's existing capability choices.
+ */
+export function planModelCapabilityRefresh(providerName, modelDetails = []) {
+  const provider = getProvider(providerName);
+  if (!provider) throw new Error(`provider "${providerName}" not found`);
+  const details = new Map(
+    (Array.isArray(modelDetails) ? modelDetails : [])
+      .filter(detail => detail && typeof detail.id === "string" && detail.id.trim())
+      .map(detail => [detail.id.trim(), detail]),
+  );
+  return buildCapabilityRefreshPlan(provider, details);
+}
+
+/**
+ * Apply only explicit server capability declarations to existing models.
+ * Manual edits and prior confirmed declarations are locks and are never
+ * replaced by a later sync. The returned ids are safe for UI summaries.
+ */
+export function refreshModelCapabilities(providerName, modelDetails = []) {
+  const preview = planModelCapabilityRefresh(providerName, modelDetails);
+  if (preview.length === 0) return { provider: providerName, changed: [] };
+  let changed = [];
+  updateModels(models => {
+    const provider = models.providers[providerName];
+    if (!provider) throw new Error(`provider "${providerName}" not found`);
+    const details = new Map(
+      (Array.isArray(modelDetails) ? modelDetails : [])
+        .filter(detail => detail && typeof detail.id === "string" && detail.id.trim())
+        .map(detail => [detail.id.trim(), detail]),
+    );
+    const plan = buildCapabilityRefreshPlan(provider, details);
+    changed = plan.map(change => change.id);
+    for (const change of plan) {
+      const model = provider.models.find(item => item.id === change.id);
+      if (!model) continue;
+      Object.assign(model, change.patch);
+    }
+  });
+  return { provider: providerName, changed };
+}
+
+function buildCapabilityRefreshPlan(provider, details) {
+  const plan = [];
+  for (const model of provider.models || []) {
+    const detail = details.get(model.id);
+    if (!detail) continue;
+    const inferred = inferModelCapabilities(model.id, { api: provider.api, declared: detail });
+    const currentCapabilities = model.capabilities && typeof model.capabilities === "object"
+      ? structuredClone(model.capabilities)
+      : {};
+    const patch = {};
+    const fields = [];
+
+    if (inferred.capabilities.input.confidence === "confirmed" &&
+      !isLockedCapability(currentCapabilities.input)) {
+      if (!sameInput(model.input, inferred.input)) {
+        patch.input = inferred.input;
+        fields.push("input");
+      }
+      if (!sameCapability(currentCapabilities.input, inferred.capabilities.input)) {
+        currentCapabilities.input = inferred.capabilities.input;
+        fields.push("input evidence");
+      }
+    }
+
+    if (inferred.capabilities.reasoning.confidence === "confirmed" &&
+      !isLockedCapability(currentCapabilities.reasoning)) {
+      if (Boolean(model.reasoning) !== inferred.reasoning) {
+        patch.reasoning = inferred.reasoning;
+        fields.push("reasoning");
+      }
+      if (!sameCapability(currentCapabilities.reasoning, inferred.capabilities.reasoning)) {
+        currentCapabilities.reasoning = inferred.capabilities.reasoning;
+        fields.push("reasoning evidence");
+      }
+    }
+
+    if (inferred.capabilities.contextWindow.confidence === "confirmed" &&
+      !isLockedCapability(currentCapabilities.contextWindow)) {
+      if (model.contextWindow !== inferred.contextWindow) {
+        patch.contextWindow = inferred.contextWindow;
+        fields.push("context window");
+      }
+      if (!sameCapability(currentCapabilities.contextWindow, inferred.capabilities.contextWindow)) {
+        currentCapabilities.contextWindow = inferred.capabilities.contextWindow;
+        fields.push("context window evidence");
+      }
+    }
+
+    if (fields.length > 0) {
+      patch.capabilities = currentCapabilities;
+      plan.push({ id: model.id, fields, patch });
+    }
+  }
+  return plan;
+}
+
+function sameCapability(left, right) {
+  return left?.confidence === right?.confidence && left?.source === right?.source;
+}
+
+/**
+ * Repair only rows whose capability registry has a concrete inference. Rows
+ * marked manual/confirmed, and rows that remain unknown, are left untouched.
+ */
+export function repairModelCapabilities(providerName, modelId) {
+  const changed = [];
+  updateModels(models => {
+    const provider = models.providers[providerName];
+    if (!provider) throw new Error(`provider "${providerName}" not found`);
+    for (const model of provider.models || []) {
+      if (modelId && model.id !== modelId) continue;
+      const lockedInput = isLockedCapability(model.capabilities?.input);
+      const lockedReasoning = isLockedCapability(model.capabilities?.reasoning);
+      const lockedContext = isLockedCapability(model.capabilities?.contextWindow);
+      const inferred = inferModelCapabilities(model.id, { api: provider.api });
+      const next = { ...model };
+      let didChange = false;
+      const transport = inferModelTransport(model.id, { api: provider.api });
+      if (transport.thinkingLevelMap && next.thinkingLevelMap === undefined) {
+        next.thinkingLevelMap = transport.thinkingLevelMap;
+        didChange = true;
+      }
+      if (transport.compat && next.compat === undefined) {
+        next.compat = transport.compat;
+        didChange = true;
+      }
+      if (!lockedInput && inferred.capabilities.input.confidence !== "unknown" && !sameInput(next.input, inferred.input)) {
+        next.input = inferred.input;
+        didChange = true;
+      }
+      if (!lockedReasoning && inferred.capabilities.reasoning.confidence !== "unknown" && next.reasoning !== inferred.reasoning) {
+        next.reasoning = inferred.reasoning;
+        didChange = true;
+      }
+      if (!lockedContext && inferred.capabilities.contextWindow.confidence !== "unknown" &&
+        next.contextWindow !== inferred.contextWindow) {
+        next.contextWindow = inferred.contextWindow;
+        didChange = true;
+      }
+      const capabilities = next.capabilities && typeof next.capabilities === "object"
+        ? structuredClone(next.capabilities)
+        : {};
+      if (!lockedInput && inferred.capabilities.input.confidence !== "unknown" && !isLockedCapability(capabilities.input)) {
+        capabilities.input = inferred.capabilities.input;
+        didChange = true;
+      }
+      if (!lockedReasoning && inferred.capabilities.reasoning.confidence !== "unknown" && !isLockedCapability(capabilities.reasoning)) {
+        capabilities.reasoning = inferred.capabilities.reasoning;
+        didChange = true;
+      }
+      if (!lockedContext && inferred.capabilities.contextWindow.confidence !== "unknown" &&
+        !isLockedCapability(capabilities.contextWindow)) {
+        capabilities.contextWindow = inferred.capabilities.contextWindow;
+        didChange = true;
+      }
+      if (didChange) {
+        next.capabilities = capabilities;
+        changed.push(next.id);
+        const index = provider.models.indexOf(model);
+        provider.models[index] = next;
+      }
+    }
+  });
+  return { provider: providerName, changed };
+}
+
+function isLockedCapability(entry) {
+  return entry?.source === "manual" || entry?.confidence === "confirmed";
+}
+
+function sameInput(left, right) {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
+    left.every((value, index) => value === right[index]);
 }
 
 /**
@@ -255,7 +546,18 @@ export async function probeProvider(provider, { timeoutMs = 10_000 } = {}) {
       const res = await fetch(url, { headers: req.headers, signal: ac.signal });
       const ms = Date.now() - started;
       const text = await res.text();
-      if (res.ok) return { ok: true, status: res.status, ms, url, attempts: index + 1, models: extractModelIds(text) };
+      if (res.ok) {
+        const parsed = extractModelEntries(text);
+        return {
+          ok: true,
+          status: res.status,
+          ms,
+          url,
+          attempts: index + 1,
+          models: parsed.ids,
+          modelDetails: parsed.details,
+        };
+      }
 
       const error = redact(shortError(res.status, text), req.secret);
       // Only a missing endpoint is worth another guess; 401 or 500 is the answer.
@@ -321,17 +623,75 @@ function networkError(err, timeoutMs) {
   }
 }
 
-/** Pull model ids out of an OpenAI- or Anthropic- or Google-shaped list response. */
-function extractModelIds(text) {
+/**
+ * Pull ids and capability hints out of an OpenAI-, Anthropic- or Google-shaped
+ * model list.  Most gateways only return ids; those rows remain eligible for
+ * the model-name inference path instead of being treated as text-only.
+ */
+function extractModelEntries(text) {
   try {
     const body = JSON.parse(text);
     const rows = body.data ?? body.models ?? [];
-    return rows
-      .map(m => (typeof m === "string" ? m : m.id ?? m.name))
-      .filter(Boolean)
-      .map(id => String(id).replace(/^models\//, ""));
+    const details = [];
+    const ids = [];
+    for (const row of rows) {
+      const rawId = typeof row === "string" ? row : row?.id ?? row?.name;
+      if (!rawId) continue;
+      const id = String(rawId).replace(/^models\//, "");
+      if (!ids.includes(id)) ids.push(id);
+      if (typeof row !== "object" || row === null) continue;
+
+      const detail = { id };
+      for (const key of [
+        "input",
+        "input_modalities",
+        "inputModalities",
+        "modalities",
+        "vision",
+        "supports_vision",
+        "supportsVision",
+        "capabilities",
+        "reasoning",
+        "supports_reasoning",
+        "supportsReasoning",
+        "supports_reasoning_effort",
+        "supportsReasoningEffort",
+        "thinking",
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+        "contextWindow",
+        "context_window",
+        "maxContextWindow",
+        "max_context_window",
+        "contextLength",
+        "context_length",
+        "maxContextLength",
+        "max_context_length",
+        "contextLimit",
+        "context_limit",
+        "contextWindowTokens",
+        "context_window_tokens",
+        "maxContextTokens",
+        "max_context_tokens",
+        "maxInputTokens",
+        "max_input_tokens",
+        "inputTokenLimit",
+        "input_token_limit",
+        "limits",
+        "limit",
+        "top_provider",
+        "topProvider",
+        "metadata",
+        "model_info",
+        "modelInfo",
+      ]) {
+        if (row[key] !== undefined) detail[key] = row[key];
+      }
+      if (Object.keys(detail).length > 1) details.push(detail);
+    }
+    return { ids, details };
   } catch {
-    return [];
+    return { ids: [], details: [] };
   }
 }
 

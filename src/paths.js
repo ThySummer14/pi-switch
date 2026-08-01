@@ -31,6 +31,14 @@ export const paths = {
   get profiles() {
     return join(agentDir(), "profiles.json");
   },
+  /** Declarative registry of local package-maintenance check scripts. */
+  get maintenanceChecks() {
+    return join(agentDir(), "maintenance-checks.json");
+  },
+  /** Cached copy of the credential-free official Provider template catalog. */
+  get providerCatalog() {
+    return join(agentDir(), "pi-switch-provider-catalog.json");
+  },
   /** Pi-owned global MCP override layer (precedence 4 of 6). */
   get piMcp() {
     return join(agentDir(), "mcp.json");

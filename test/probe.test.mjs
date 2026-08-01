@@ -125,6 +125,32 @@ test("model ids are read from data[], models[], and Google's models/ prefix", as
   assert.deepEqual(result.models, ["gemini-3-pro", "bare-string"]);
 });
 
+test("model-list capability hints are returned separately from the id list", async () => {
+  handler = () => [200, JSON.stringify({ data: [
+    { id: "grok-4.5", input_modalities: ["text", "image"], supports_reasoning: true },
+    { id: "plain-model" },
+  ] })];
+  const result = await probeProvider(provider());
+  assert.deepEqual(result.models, ["grok-4.5", "plain-model"]);
+  assert.deepEqual(result.modelDetails, [{
+    id: "grok-4.5",
+    input_modalities: ["text", "image"],
+    supports_reasoning: true,
+  }]);
+});
+
+test("model-list context limits are preserved for automatic window inference", async () => {
+  handler = () => [200, JSON.stringify({ data: [
+    { id: "provider-large", context_length: 512000 },
+    { id: "provider-nested", limits: { context_window: "1M" } },
+  ] })];
+  const result = await probeProvider(provider());
+  assert.deepEqual(result.modelDetails, [
+    { id: "provider-large", context_length: 512000 },
+    { id: "provider-nested", limits: { context_window: "1M" } },
+  ]);
+});
+
 test("a 200 that is not JSON yields an empty list rather than throwing", async () => {
   handler = () => [200, "<html>hello</html>", { "content-type": "text/html" }];
   const result = await probeProvider(provider());

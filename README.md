@@ -10,6 +10,10 @@ A cc-switch equivalent for the [Pi coding agent](https://github.com/badlogic/pi-
 
 The desktop app provides the same config-safe operations in a clean CC Switch-style interface. It reuses the CLI core, including file locks, backups, atomic writes, schema validation, and macOS Keychain handling.
 
+The Provider form includes credential-free templates for common OpenAI-compatible, Anthropic, DeepSeek, and Volcengine Agent Plan endpoints. Templates only prefill public endpoint/API/model fields; API keys are always entered separately and existing Provider names cannot be overwritten by an add operation.
+
+The **Provider template catalog** action can refresh those public defaults from this repository's fixed HTTPS catalog. Remote documents are versioned and strictly limited to the template id, label, description, Provider name, base URL, API type, and model id. Unknown fields, credential fields, redirects, non-HTTPS endpoints, unsupported API types, oversized responses, and invalid cache fingerprints are rejected. A successful sync writes only `~/.pi/agent/pi-switch-provider-catalog.json`; it never changes `models.json`, and the UI can discard the cache to return to the templates bundled with the app.
+
 Requirements: Node.js 22 or newer, Rust, and the Tauri v2 system prerequisites. Node.js remains required when running the packaged app because its local bridge executes the existing JavaScript core.
 
 ```bash
@@ -26,6 +30,8 @@ src-tauri/target/release/bundle/macos/Pi Switch.app
 ```
 
 The desktop bridge receives secrets through stdin, never command-line arguments, and does not return provider API keys to the webview.
+
+The Providers page also has a configuration menu for a safe backup workflow. **Export** downloads a JSON file containing provider/model metadata but no API key, token, header, or password. **Restore** checks that file first, shows how many Providers/models will change, preserves the existing key reference for same-named Providers, and writes through the normal lock/backup/schema-validation path. New Providers are intentionally restored without credentials and can be keyed afterwards.
 
 cc-switch does not know about Pi: it manages `claude`, `codex`, `gemini`, `openclaw` and friends, all of which keep their config somewhere other than `~/.pi/agent`. pi-switch covers Pi's own files, and imports from cc-switch's database read-only so existing relay setups do not need re-entering.
 
@@ -58,6 +64,7 @@ Run `pi-switch` with no arguments for the UI.
 | providers, models | `~/.pi/agent/models.json` | yes |
 | default provider/model | `~/.pi/agent/settings.json` | yes |
 | startup profiles | `~/.pi/agent/profiles.json` | no |
+| Provider template cache | `~/.pi/agent/pi-switch-provider-catalog.json` | yes, explicit desktop sync only |
 | mcp | `~/.pi/agent/mcp.json`, `<cwd>/.pi/mcp.json` | yes (the `disabled` flag only) |
 | mcp (shared layers) | `~/.config/mcp/mcp.json`, `<cwd>/.mcp.json` | never |
 | skills | `settings.skills[]`, `settings.ccPlugins[]` | yes |
@@ -67,6 +74,12 @@ Run `pi-switch` with no arguments for the UI.
 `pi-switch paths` prints this at runtime. Every file pi-switch rewrites is copied to `~/.pi/agent/pi-switch-backups/<name>.<timestamp>` first, and writes go through a temp file plus rename, so a crash cannot leave a truncated `models.json` (which stops Pi from starting).
 
 Changes to `models.json` and `settings.json` take effect the next time Pi starts. MCP toggles need `/reload` inside Pi.
+
+Model entries can record `source` and Pi's `cost` fields. The desktop editor shows context window, output limit, reasoning, input modalities, source, and per-million-token USD rates; unknown pricing stays at zero rather than being guessed.
+
+Model capabilities and context windows are kept separate from their evidence. A model list that only returns ids does not prove that a model is text-only or non-reasoning: unknown image support fails open to `input: ["text", "image"]`, while unknown reasoning remains off and is shown as **待确认**. Context windows use provider fields first, then the curated model registry; unknown rows use a clearly marked 200k fallback. Explicit server metadata wins, and manual edits are marked so the repair action will never overwrite them. The Models page's **修复已知能力** action repairs known model-family mismatches such as legacy `grok-4.5` rows that were saved as text-only with `reasoning: false`, and repairs known context windows when the row still uses the fallback. CC Switch/Codex catalog imports treat `input_modalities: ["text"]` and template reasoning fields as unverified hints; image/true hints are retained without locking them, so a stale catalog cannot permanently disable a capability.
+
+For Qwen 3.8 Max Preview on an Anthropic-compatible Token Plan endpoint, Pi Switch records `thinkingLevelMap.off = null`. Pi then clamps an inherited `off` session to a supported thinking level instead of sending the endpoint's rejected `enable_thinking: false` value.
 
 ## Commands
 
@@ -93,6 +106,8 @@ pi-switch paths
 
 Profiles live in `~/.pi/agent/profiles.json`. A profile selects the working directory and passes `--mode-start` to Pi; project `.pi/settings.json` files decide which inherited package resources remain loaded.
 
+The novel profile sets `retryStallTimeoutMs: 300000`. `pi-switch` applies it both as the parent Pi CLI flag and as `PI_RETRY_STALL_TIMEOUT_MS`, which subagents inherit. Long high-thinking writing can remain silent for more than the retry extension's 90-second default; the five-minute value avoids aborting healthy reasoning without weakening code or Obsidian startup behavior.
+
 ```bash
 pi-switch run code
 pi-switch run novel
@@ -101,9 +116,11 @@ pi-switch run novel -- --help       # forward Pi flags after --
 pi-switch run novel --dry-run       # inspect without launching
 ```
 
-The default `code` profile keeps the caller's current directory. Fixed workflow profiles move to their configured roots before Pi starts. `/mode` remains a lightweight in-session switch; it does not replace startup resource isolation.
+The default `code` profile keeps the caller's current directory when launched from the CLI. A non-fixed profile may also define `desktopCwd`; the desktop launch button uses that directory because a packaged app's process cwd is its internal `Contents/Resources` folder, not a user project. When `desktopCwd` is absent, the desktop falls back to the user's home directory. Fixed workflow profiles continue to use `cwd`. A profile cannot define both `cwd` and `desktopCwd`. `/mode` remains a lightweight in-session switch; it does not replace startup resource isolation.
 
 `--json` works on `ls`, `test`, `import`, `mcp ls`, `skills ls`, `agents ls` and `doctor`. `test`, `doctor` and `agents` exit non-zero when they find an error, so they drop into a pre-commit hook or CI step as-is.
+
+`settings.skills` exclusion patterns are shown as neutral `exclude` rows. A zero match on an exclusion is expected and is not a broken Skill path; missing concrete paths remain errors.
 
 ## Keys
 
@@ -133,6 +150,7 @@ The checks target the failure modes that produce no error message anywhere:
 - Agent frontmatter problems (below).
 - Agent `.md` files in a subdirectory of `agents/`. The subagents loader does `readdirSync().filter(f => f.endsWith(".md"))` — no recursion — so nested files never load. `agents/cc-plugins/` is called out separately: that directory is owned by `@asermax/pi-cc-plugins` and gets `rm -rf`'d when its refcount hits zero, so hand-written files there are lost.
 - MCP `env` entries referencing variables that are unset in the current shell.
+- Local package patches registered in `~/.pi/agent/maintenance-checks.json`. Each entry is restricted to an absolute `.mjs` file and is invoked only as `node <script> --check`; exit `1` names the repair command, while exit `2` stops automatic repair for upstream review. Script output is never included in findings.
 
 `--probe` adds the network round trip.
 
@@ -158,7 +176,7 @@ pi-switch import --all    # write
 
 Claude Code rows map onto `anthropic-messages`, with the `[1M]` suffix stripped from model ids and a trailing `/v1` removed from the base URL (Pi's client appends `/v1/messages` itself). Codex rows are read out of their TOML blob; `wire_api` picks between `openai-responses` and `openai-completions`. OpenClaw rows are already in Pi's shape.
 
-Import never overwrites: a name that already exists gets an `-<app_type>` or `-2` suffix, since the existing entry is usually the hand-tuned one. Imported models get conservative defaults — 200k context, 32k output, `reasoning: false`, zero cost — because a relay's real limits are unknown, and a relay that silently drops `thinking` returns empty text. Fix them with `pi-switch` on the models tab, or `sync` against the live endpoint.
+Import never overwrites: a name that already exists gets an `-<app_type>` or `-2` suffix, since the existing entry is usually the hand-tuned one. The macOS desktop import stores imported keys in Keychain by default; turning that option off deliberately keeps them inline and shows a warning. Imported models use the context window declared by the provider/catalog when available, then a curated model registry (for example `kimi-k3` 1M, `deepseek-v4-pro` 1M, `grok-4.5` 500k and `step-3.7-flash` 256k); only unknown models use a visibly marked 200k fallback. Model-name or server capability evidence determines `input`/`reasoning`; unknown evidence is retained as **待确认** instead of being presented as a verified `false`.
 
 Keys arrive in plaintext; `pi-switch key <provider>` moves them into the keychain.
 

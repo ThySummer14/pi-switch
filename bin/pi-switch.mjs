@@ -12,10 +12,12 @@ import { runDoctor } from "../src/doctor.js";
 import { ccSwitchAvailable, planImportNames, readCcSwitchProviders } from "../src/import-ccswitch.js";
 import { keychainSpec, parseKeychainSpec, serviceNameFor, setKey } from "../src/keychain.js";
 import { listServers, setDisabled } from "../src/mcp.js";
+import { createModelDefaults } from "../src/model-capabilities.js";
 import { paths, tildify } from "../src/paths.js";
-import { buildProfileArgs, listProfiles, resolveProfile } from "../src/profiles.js";
+import { buildProfileArgs, profileEnvironment, listProfiles, resolveProfile } from "../src/profiles.js";
 import {
-  deleteProvider, diffModels, listProviders, patchProvider, probeProvider,
+  deleteProvider, diffModels, listProviders, patchProvider, planModelCapabilityRefresh,
+  probeProvider, refreshModelCapabilities,
   setDefault, setThinking, THINKING_LEVELS, upsertModel, upsertProvider,
 } from "../src/providers.js";
 import { addSkillPath, listCcPlugins, listSkillPaths, listSkills, pruneSkillPaths, removeSkillPath } from "../src/skills.js";
@@ -140,19 +142,21 @@ function cmdRun(raw) {
     : controls.filter((arg, index) => index !== profileIndex && arg !== "--dry-run");
   const profile = resolveProfile(profileName);
   const piArgs = buildProfileArgs(profile, extraArgs);
+  const profileEnv = profileEnvironment(profile);
   const command = process.env.PI_SWITCH_PI_BIN || "pi";
 
   if (dryRun) {
     const quote = value => /^[A-Za-z0-9_./:@=-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
     out(`${paint(profile.name, color.bold)}  cwd=${tildify(profile.cwd)}\n`);
-    out(`${[command, ...piArgs].map(quote).join(" ")}\n`);
+    const envPrefix = Object.entries(profileEnv).map(([key, value]) => `${key}=${quote(value)}`);
+    out(`${[...envPrefix, command, ...piArgs].map((part, index) => index < envPrefix.length ? part : quote(part)).join(" ")}\n`);
     return;
   }
 
   out(paint(`profile=${profile.name} mode=${profile.mode} cwd=${tildify(profile.cwd)}\n`, color.grey));
   const result = spawnSync(command, piArgs, {
     cwd: profile.cwd,
-    env: process.env,
+    env: { ...process.env, ...profileEnv },
     stdio: "inherit",
   });
   if (result.error) throw result.error;
@@ -279,7 +283,7 @@ async function cmdAdd() {
     api,
     apiKey,
     ...(api === "anthropic-messages" ? { authHeader: true } : {}),
-    models: [newModel(model, name)],
+    models: [newModel(model, name, api)],
   });
   out(`${paint(glyph.ok, color.green)} added provider ${paint(name, color.bold)} — pi-switch test ${name}\n`);
   if (!useKeychain && process.platform === "darwin") {
@@ -287,21 +291,9 @@ async function cmdAdd() {
   }
 }
 
-/**
- * A new model entry with conservative defaults. Cost is zeroed and reasoning is
- * off because a relay's real pricing is unknown and relays that swallow
- * `thinking` return empty text.
- */
-function newModel(id, providerName) {
-  return {
-    id,
-    name: `${id} (${providerName})`,
-    contextWindow: 200_000,
-    maxTokens: 32_768,
-    input: ["text"],
-    reasoning: false,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  };
+/** A new model entry with zero pricing and capability provenance. */
+function newModel(id, providerName, api) {
+  return createModelDefaults(id, providerName, { api });
 }
 
 function cmdThinking([level]) {
@@ -329,21 +321,36 @@ async function cmdSync([providerName]) {
   const result = await probeProvider(provider.raw);
   if (!result.ok) throw new Error(`${providerName}: ${result.error}`);
   const diff = diffModels(provider.models, result.models);
-  if (diff.extra.length === 0) {
-    out(`${paint(glyph.ok, color.green)} nothing to add — ${result.models.length} models listed\n`);
+  const capabilityUpdates = planModelCapabilityRefresh(providerName, result.modelDetails);
+  if (diff.extra.length === 0 && capabilityUpdates.length === 0) {
+    out(`${paint(glyph.ok, color.green)} nothing to add or refresh — ${result.models.length} models listed\n`);
     return;
   }
   if (!flags.has("--all")) {
-    out(`${diff.extra.length} model(s) available but not configured:\n`);
-    for (const id of diff.extra) out(`  ${id}\n`);
-    out(paint(`\nrun with --all to add them (contextWindow 200k, maxTokens 32k, reasoning off)\n`, color.grey));
+    if (diff.extra.length > 0) {
+      out(`${diff.extra.length} model(s) available but not configured:\n`);
+      for (const id of diff.extra) out(`  ${id}\n`);
+    }
+    if (capabilityUpdates.length > 0) {
+      out(`${capabilityUpdates.length} existing model(s) have explicit server capability updates:\n`);
+      for (const update of capabilityUpdates) out(`  ${update.id}: ${update.fields.join(", ")}\n`);
+    }
+    out(paint(`\nrun with --all to apply these updates and add models (context window uses the server/model registry; unknown models keep a marked 200k fallback, maxTokens 32k)\n`, color.grey));
     return;
   }
+  const capabilityRefresh = refreshModelCapabilities(providerName, result.modelDetails);
+  const details = new Map((result.modelDetails || []).map(item => [item.id, item]));
   for (const id of diff.extra) {
-    upsertModel(providerName, { id, name: `${id} (${providerName})`, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+    const detail = details.get(id);
+    upsertModel(providerName, {
+      id,
+      name: `${id} (${providerName})`,
+      capabilitySource: detail,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
   }
-  out(`${paint(glyph.ok, color.green)} added ${diff.extra.length} model(s) to ${providerName}\n`);
-  out(paint("  check contextWindow / maxTokens / reasoning by hand — the defaults are conservative\n", color.grey));
+  out(`${paint(glyph.ok, color.green)} added ${diff.extra.length} model(s), refreshed ${capabilityRefresh.changed.length} existing model(s) in ${providerName}\n`);
+  out(paint("  capability values include their evidence level; review rows marked unknown before sending images or enabling reasoning\n", color.grey));
 }
 
 function cmdImport() {
@@ -409,8 +416,15 @@ function cmdSkills([sub, value]) {
     const total = rows.reduce((n, r) => n + r.count, 0);
     out(`${paint(`${rows.length} path(s), ${total} skill(s) reachable`, color.bold)}\n\n`);
     for (const r of rows) {
-      const mark = r.exists ? (r.count > 0 ? paint(glyph.ok, color.green) : paint(glyph.warn, color.yellow)) : paint(glyph.bad, color.red);
-      out(`${mark} ${pad(String(r.count), 5)}${pad(paint(r.kind, color.grey), 9)}${r.exists ? r.entry : paint(r.entry, color.red)}\n`);
+      const excluded = r.kind === "exclude";
+      const mark = excluded
+        ? paint(glyph.off, color.grey)
+        : r.exists
+          ? (r.count > 0 ? paint(glyph.ok, color.green) : paint(glyph.warn, color.yellow))
+          : paint(glyph.bad, color.red);
+      const count = excluded ? "-" : String(r.count);
+      const kind = r.selector === "include" ? "include" : r.kind;
+      out(`${mark} ${pad(count, 5)}${pad(paint(kind, color.grey), 9)}${r.exists ? r.entry : paint(r.entry, color.red)}\n`);
     }
     const plugins = listCcPlugins();
     if (plugins.length > 0) {
@@ -484,6 +498,8 @@ function cmdPaths() {
     ["models.json", paths.models, "provider + model catalog (written)"],
     ["settings.json", paths.settings, "defaultProvider/Model, skills[], packages[] (written)"],
     ["profiles.json", paths.profiles, "startup profile registry (read only)"],
+    ["maintenance-checks.json", paths.maintenanceChecks, "local package patch registry (read only)"],
+    ["pi-switch-provider-catalog.json", paths.providerCatalog, "validated remote Provider template cache (written)"],
     ["mcp.json (pi global)", paths.piMcp, "pi-owned MCP override layer (written)"],
     ["mcp.json (shared)", paths.sharedMcp, "shared MCP config (read only)"],
     ["agents/", paths.agents, "global subagents — no recursion (read only)"],

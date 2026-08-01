@@ -9,6 +9,7 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { paths } from "./paths.js";
+import { createModelDefaults, inferCcSwitchCatalogCapabilities } from "./model-capabilities.js";
 
 /** app_type values that carry something pi can use. */
 const SUPPORTED_APP_TYPES = new Set(["claude", "claude-desktop", "openclaw", "codex"]);
@@ -107,11 +108,13 @@ function convertClaude(config, displayName) {
   const apiKey = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("no ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY in env");
 
-  const ids = [];
+  const models = [];
   const push = id => {
     if (!id) return;
-    const clean = String(id).replace(/\[[^\]]*\]$/, "");
-    if (!ids.includes(clean)) ids.push(clean);
+    const raw = String(id);
+    const clean = raw.replace(/\[[^\]]*\]$/, "");
+    if (models.some(model => model.id === clean)) return;
+    models.push({ id: clean, ...( /\[(?:1m|1million)\]$/i.test(raw) ? { contextWindow: 1_000_000 } : {}) });
   };
   // Prefer the explicit *_MODEL_NAME fields, then the routed model vars.
   push(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME);
@@ -122,7 +125,7 @@ function convertClaude(config, displayName) {
   push(env.ANTHROPIC_DEFAULT_SONNET_MODEL);
   push(env.ANTHROPIC_DEFAULT_HAIKU_MODEL);
 
-  if (ids.length === 0) throw new Error("no model ids found in env");
+  if (models.length === 0) throw new Error("no model ids found in env");
 
   return {
     converted: {
@@ -130,7 +133,7 @@ function convertClaude(config, displayName) {
       api: "anthropic-messages",
       apiKey,
       authHeader: true,
-      models: ids.map(id => defaultModel(id, displayName)),
+      models: models.map(model => defaultModel(model.id, displayName, "anthropic-messages", model)),
     },
     reason: null,
   };
@@ -149,7 +152,7 @@ function convertOpenClaw(config, displayName) {
   if (!config.baseUrl) throw new Error("no baseUrl");
   if (!config.apiKey) throw new Error("no apiKey");
   const models = (config.models || []).map(m =>
-    m.id ? { ...defaultModel(m.id, displayName), ...m, name: m.name ? `${m.name} (${displayName})` : undefined } : null,
+    m.id ? normalizeOpenClawModel(m, displayName, config.api || "openai-completions") : null,
   ).filter(Boolean);
   if (models.length === 0) throw new Error("no models defined");
   return {
@@ -161,6 +164,55 @@ function convertOpenClaw(config, displayName) {
     },
     reason: null,
   };
+}
+
+/**
+ * OpenClaw rows can be either hand-authored Pi models or copied catalog rows.
+ * Keep an explicit manual/server capability lock, but do not let an unlocked
+ * legacy `input: ["text"]` / `reasoning: false` pair bypass the shared inference.
+ */
+function normalizeOpenClawModel(source, displayName, api) {
+  const base = defaultModel(source.id, displayName, api, source);
+  const {
+    id: _id,
+    name: _name,
+    input: _input,
+    reasoning: _reasoning,
+    capabilities: _capabilities,
+    contextWindow: _contextWindow,
+    context_window: _context_window,
+    maxContextWindow: _maxContextWindow,
+    max_context_window: _max_context_window,
+    contextLength: _contextLength,
+    context_length: _context_length,
+    contextLimit: _contextLimit,
+    context_limit: _context_limit,
+    maxTokens: _maxTokens,
+    max_tokens: _max_tokens,
+    ...metadata
+  } = source;
+  const inputLocked = source.capabilities && typeof source.capabilities === "object" &&
+    isLockedCapability(source.capabilities.input);
+  const reasoningLocked = source.capabilities && typeof source.capabilities === "object" &&
+    isLockedCapability(source.capabilities.reasoning);
+  const contextLocked = source.capabilities && typeof source.capabilities === "object" &&
+    isLockedCapability(source.capabilities.contextWindow);
+  const lockedCapabilities = { ...base.capabilities };
+  if (inputLocked) lockedCapabilities.input = source.capabilities.input;
+  if (reasoningLocked) lockedCapabilities.reasoning = source.capabilities.reasoning;
+  if (contextLocked) lockedCapabilities.contextWindow = source.capabilities.contextWindow;
+  return {
+    ...base,
+    ...metadata,
+    ...(inputLocked && source.input !== undefined ? { input: source.input } : {}),
+    ...(reasoningLocked && source.reasoning !== undefined ? { reasoning: source.reasoning } : {}),
+    ...((inputLocked || reasoningLocked || contextLocked) ? { capabilities: lockedCapabilities } : {}),
+    name: source.name ? `${source.name} (${displayName})` : base.name,
+  };
+}
+
+function isLockedCapability(entry) {
+  return entry?.source === "manual" || entry?.confidence === "confirmed";
 }
 
 /**
@@ -181,7 +233,12 @@ function convertCodex(config, displayName) {
       baseUrl: baseUrl.replace(/\/+$/, ""),
       api: wireApi === "chat" ? "openai-completions" : "openai-responses",
       apiKey,
-      models: [defaultModel(model, displayName)],
+      models: [defaultModel(model, displayName, wireApi === "chat" ? "openai-completions" : "openai-responses", {
+        model: model,
+        // Some cc-switch versions persist the mapping under settings_config;
+        // preserve it when present instead of reducing it to a text-only row.
+        ...(config.modelCatalog?.models?.find(entry => entry?.model === model || entry?.slug === model) || {}),
+      })],
     },
     reason: null,
   };
@@ -193,20 +250,26 @@ function tomlValue(toml, key) {
   return m ? m[1] : null;
 }
 
-/**
- * A conservative model entry. Costs are zeroed because a relay's real pricing is
- * unknown; reasoning defaults off because relays that don't forward `thinking`
- * return empty text when it is sent.
- */
-function defaultModel(id, displayName) {
+/** A credential-preserving model entry with capability evidence attached. */
+function defaultModel(id, displayName, api, source = {}) {
+  const model = createModelDefaults(id, displayName, {
+    api,
+    capabilitySource: source,
+    contextSourceType: "cc-switch-catalog",
+  });
+  const capabilities = inferCcSwitchCatalogCapabilities(id, { api, catalog: source });
+  const contextWindow = capabilities.contextWindow;
+  const maxTokens = Number(source.maxTokens ?? source.max_tokens);
   return {
-    id,
-    name: `${id} (${displayName})`,
-    contextWindow: 200_000,
-    maxTokens: 32_768,
-    input: ["text"],
-    reasoning: false,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...model,
+    input: capabilities.input,
+    reasoning: capabilities.reasoning,
+    capabilities: capabilities.capabilities,
+    ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+    ...(Number.isFinite(maxTokens) && maxTokens > 0 ? { maxTokens } : {}),
+    name: source.displayName || source.display_name
+      ? `${source.displayName || source.display_name} (${displayName})`
+      : `${id} (${displayName})`,
   };
 }
 

@@ -19,19 +19,23 @@ import { loadSettings, updateSettings } from "./store.js";
 export function listSkillPaths() {
   const settings = loadSettings();
   return (settings.skills || []).map(entry => {
-    const resolved = untildify(entry);
+    if (/^[!-]/.test(entry)) {
+      return { entry, resolved: entry, exists: true, kind: "exclude", count: 0, names: [] };
+    }
+    const forceInclude = entry.startsWith("+");
+    const resolved = untildify(forceInclude ? entry.slice(1) : entry);
     if (!existsSync(resolved)) {
-      return { entry, resolved, exists: false, kind: "missing", count: 0, names: [] };
+      return { entry, resolved, exists: false, kind: "missing", count: 0, names: [], ...(forceInclude && { selector: "include" }) };
     }
     const st = statSync(resolved);
     if (st.isFile()) {
-      return { entry, resolved, exists: true, kind: "file", count: 1, names: [basename(resolved)] };
+      return { entry, resolved, exists: true, kind: "file", count: 1, names: [basename(resolved)], ...(forceInclude && { selector: "include" }) };
     }
     if (existsSync(join(resolved, "SKILL.md"))) {
-      return { entry, resolved, exists: true, kind: "skill", count: 1, names: [basename(resolved)] };
+      return { entry, resolved, exists: true, kind: "skill", count: 1, names: [basename(resolved)], ...(forceInclude && { selector: "include" }) };
     }
     const names = childSkills(resolved);
-    return { entry, resolved, exists: true, kind: "dir", count: names.length, names };
+    return { entry, resolved, exists: true, kind: "dir", count: names.length, names, ...(forceInclude && { selector: "include" }) };
   });
 }
 
@@ -51,7 +55,7 @@ function childSkills(dir) {
 export function listSkills() {
   const out = new Map();
   for (const row of listSkillPaths()) {
-    if (!row.exists) continue;
+    if (!row.exists || row.kind === "exclude") continue;
     for (const name of row.names) {
       const dir = row.kind === "dir" ? join(row.resolved, name) : row.resolved;
       if (!out.has(name)) out.set(name, { name, dir, from: row.entry, description: readDescription(dir) });
