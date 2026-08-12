@@ -205,7 +205,7 @@ test("desktop dashboard exposes credential-free provider presets", () => {
   assert.equal(response.data.providerCatalog.source, "bundled");
   assert.match(response.data.providerCatalog.url, /^https:\/\/raw\.githubusercontent\.com\//);
   assert.equal(response.data.providerCatalog.remotePresetCount, 0);
-  assert.equal(response.data.keychainAvailable, true);
+  assert.equal(response.data.keychainAvailable, process.platform === "darwin");
   assert.equal(result.stdout.includes(secret), false);
   assert.equal(response.data.providerPresets.some(preset => "apiKey" in preset), false);
 });
