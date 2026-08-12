@@ -5,6 +5,21 @@
  */
 export function diagnoseProviderError(error) {
   const text = String(error ?? "");
+  if (/messages\.role[\s\S]{0,240}invalid value:\s*[`\"']?developer/i.test(text) ||
+    /invalid value:\s*[`\"']?developer[\s\S]{0,240}supported values[\s\S]{0,120}system/i.test(text)) {
+    return {
+      code: "developer-role-unsupported",
+      title: "服务端不支持 developer 消息角色",
+      message: "这个 OpenAI-compatible 接口只接受 system、assistant、user 和 tool。Pi Switch 已为 Kimi 模型改用 system 角色；保存修复后请新开一个 Pi 会话再试。",
+    };
+  }
+  if (/opencode(?:\.ai)?/i.test(text) && /\b404\b[\s\S]{0,4000}<\!?doctype\s+html|opencode(?:\.ai)?[\s\S]{0,4000}<html\b/i.test(text)) {
+    return {
+      code: "opencode-zen-web-404",
+      title: "OpenCode Zen 的地址填成了网页地址",
+      message: "服务端返回的是 OpenCode 官网的 HTML 404，不是 API JSON。Base URL 应填写 https://opencode.ai/zen/v1，API 类型选择 openai-completions；不要填写文档页、/docs/zen 或完整 /chat/completions 地址。",
+    };
+  }
   if (/UnsupportedModel|does not support the agent\s+plan feature/i.test(text)) {
     return {
       code: "unsupported-agent-plan-model",

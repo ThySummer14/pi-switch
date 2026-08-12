@@ -19,3 +19,10 @@ test("preset lookup falls back to the custom template", () => {
   assert.equal(getProviderPreset("volcengine-agent-plan").model, "kimi-k2.6");
   assert.equal(getProviderPreset("does-not-exist").id, "custom");
 });
+
+test("OpenCode Zen preset targets the documented free DeepSeek model", () => {
+  const preset = getProviderPreset("opencode-zen");
+  assert.equal(preset.baseUrl, "https://opencode.ai/zen/v1");
+  assert.equal(preset.api, "openai-completions");
+  assert.equal(preset.model, "deepseek-v4-flash-free");
+});

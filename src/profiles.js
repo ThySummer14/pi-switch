@@ -5,7 +5,7 @@
  * Project-local .pi/settings.json files own package filtering for that directory.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { paths, untildify } from "./paths.js";
 
@@ -23,7 +23,12 @@ export function loadProfileConfig(file = paths.profiles) {
   return config;
 }
 
-export function listProfiles({ file = paths.profiles, currentCwd = process.cwd(), useDesktopCwd = false } = {}) {
+export function listProfiles({
+  file = paths.profiles,
+  currentCwd = process.cwd(),
+  useDesktopCwd = false,
+  requestedCwd,
+} = {}) {
   const config = loadProfileConfig(file);
   return Object.entries(config.profiles).map(([name, spec]) => {
     if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
@@ -44,18 +49,34 @@ export function listProfiles({ file = paths.profiles, currentCwd = process.cwd()
     if (desktopCwd && !isAbsolute(desktopCwd)) {
       throw new Error(`profile "${name}" desktopCwd must be absolute or start with ~`);
     }
+    if (requestedCwd !== undefined
+      && (typeof requestedCwd !== "string" || !requestedCwd.trim())) {
+      throw new Error(`profile "${name}" requested cwd must be a non-empty string`);
+    }
+    const requested = requestedCwd ? untildify(requestedCwd) : null;
+    if (requested && !isAbsolute(requested)) {
+      throw new Error(`profile "${name}" requested cwd must be absolute or start with ~`);
+    }
     const preferDesktopCwd = useDesktopCwd && !spec.cwd && desktopCwd;
-    const cwd = spec.cwd
+    const configuredCwd = spec.cwd
       ? resolve(untildify(spec.cwd))
       : preferDesktopCwd
         ? resolve(desktopCwd)
         : resolve(currentCwd);
+    if (requested && spec.cwd) {
+      const configuredCanonical = canonicalDirectory(configuredCwd, `profile "${name}" cwd`);
+      const requestedCanonical = canonicalDirectory(requested, `profile "${name}" requested cwd`);
+      if (configuredCanonical !== requestedCanonical) {
+        throw new Error(`profile "${name}" cwd is fixed at ${configuredCanonical}`);
+      }
+    }
+    const cwd = requested ? resolve(requested) : configuredCwd;
     return {
       name,
       label: spec.label ?? name,
       mode: spec.mode ?? name,
       cwd,
-      cwdSource: spec.cwd ? "profile" : preferDesktopCwd ? "desktop" : "caller",
+      cwdSource: requested ? "requested" : spec.cwd ? "profile" : preferDesktopCwd ? "desktop" : "caller",
       desktopCwd: desktopCwd ? resolve(desktopCwd) : null,
       desktopCwdExists: desktopCwd ? existsSync(desktopCwd) : null,
       retryStallTimeoutMs: spec.retryStallTimeoutMs,
@@ -66,13 +87,42 @@ export function listProfiles({ file = paths.profiles, currentCwd = process.cwd()
   });
 }
 
+function canonicalDirectory(path, label) {
+  try {
+    const canonical = realpathSync.native(resolve(path));
+    if (!statSync(canonical).isDirectory()) throw new Error("not-directory");
+    return canonical;
+  } catch {
+    throw new Error(`${label} is not a directory: ${resolve(path)}`);
+  }
+}
+
 export function resolveProfile(name, options = {}) {
   const config = loadProfileConfig(options.file ?? paths.profiles);
   const selected = name || config.defaultProfile;
   if (!selected) throw new Error("no profile specified and defaultProfile is unset");
-  const profile = listProfiles(options).find(row => row.name === selected);
+  let profile = listProfiles({ ...options, requestedCwd: undefined }).find(row => row.name === selected);
   if (!profile) {
     throw new Error(`unknown profile "${selected}"; available: ${Object.keys(config.profiles).join(", ")}`);
+  }
+  if (options.requestedCwd !== undefined) {
+    const requested = untildify(options.requestedCwd);
+    if (typeof requested !== "string" || !requested.trim() || !isAbsolute(requested)) {
+      throw new Error(`profile "${selected}" requested cwd must be absolute or start with ~`);
+    }
+    const requestedCanonical = canonicalDirectory(requested, `profile "${selected}" requested cwd`);
+    if (profile.fixedCwd) {
+      const configuredCanonical = canonicalDirectory(profile.cwd, `profile "${selected}" cwd`);
+      if (configuredCanonical !== requestedCanonical) {
+        throw new Error(`profile "${selected}" cwd is fixed at ${configuredCanonical}`);
+      }
+    }
+    profile = {
+      ...profile,
+      cwd: resolve(requested),
+      cwdSource: "requested",
+      exists: true,
+    };
   }
   if (!profile.exists || !statSync(profile.cwd).isDirectory()) {
     throw new Error(`profile "${selected}" cwd is not a directory: ${profile.cwd}`);

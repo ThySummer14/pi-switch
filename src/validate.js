@@ -101,8 +101,11 @@ export function validateModel(model, path = "model") {
  */
 export function validateProvider(name, provider, path = `providers.${name}`) {
   if (!name || typeof name !== "string") fail("provider name", "is required");
-  if (/[^\p{L}\p{N}_.-]/u.test(name)) {
-    fail("provider name", `"${name}" may only contain Unicode letters, numbers, . _ -`);
+  if (name.trim() !== name) {
+    fail("provider name", `"${name}" must not start or end with spaces`);
+  }
+  if (/[^\p{L}\p{N}._ -]/u.test(name)) {
+    fail("provider name", `"${name}" may only contain Unicode letters, numbers, spaces, . _ -`);
   }
   if (!provider || typeof provider !== "object") fail(path, "must be an object");
 

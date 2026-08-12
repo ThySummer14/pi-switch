@@ -15,6 +15,7 @@ import { listServers, setDisabled } from "../src/mcp.js";
 import { createModelDefaults } from "../src/model-capabilities.js";
 import { paths, tildify } from "../src/paths.js";
 import { buildProfileArgs, profileEnvironment, listProfiles, resolveProfile } from "../src/profiles.js";
+import { resolveProfileLaunchSpec } from "../src/profile-launch.js";
 import {
   deleteProvider, diffModels, listProviders, patchProvider, planModelCapabilityRefresh,
   probeProvider, refreshModelCapabilities,
@@ -29,13 +30,14 @@ const argv = process.argv.slice(2);
 const flags = new Set(argv.filter(a => a.startsWith("-")));
 const args = argv.filter(a => !a.startsWith("-"));
 const json = flags.has("--json");
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 const HELP = `${paint("pi-switch", color.bold)} — cc-switch for the Pi coding agent
 
 ${paint("usage", color.bold)}
   pi-switch                          open the interactive switcher
   pi-switch profiles                list startup profiles
+  pi-switch resolve-profile <name>  print a machine-readable launch contract
   pi-switch run [profile]           launch pi in code / novel / obsidian profile
   pi-switch ls                       list providers and the active default
   pi-switch use <provider> [model]   set settings.defaultProvider / defaultModel
@@ -56,6 +58,7 @@ ${paint("usage", color.bold)}
 
 ${paint("flags", color.bold)}
   --json          machine-readable output where it applies
+  --cwd <path>    requested Code workspace for resolve-profile
   --no-color      plain text
   --probe         let doctor hit the network
   --all           import/act on everything without prompting
@@ -85,6 +88,8 @@ async function main() {
       return cmdList();
     case "profiles":
       return cmdProfiles();
+    case "resolve-profile":
+      return cmdResolveProfile(rest);
     case "use":
       return cmdUse(rest);
     case "thinking":
@@ -129,6 +134,20 @@ function cmdProfiles() {
     const rendered = profile.exists ? cwd : paint(`${cwd} (missing)`, color.red);
     out(`${mark} ${pad(profile.name, 14)}${pad(profile.mode, 12)}${rendered}  ${paint(profile.label, color.grey)}\n`);
   }
+}
+
+function cmdResolveProfile([profileName]) {
+  if (!profileName) throw new Error("usage: pi-switch resolve-profile <name> --json [--cwd <path>]");
+  const spec = resolveProfileLaunchSpec(profileName, {
+    requestedCwd: flagValue("cwd"),
+    useDesktopCwd: true,
+  });
+  if (json) return out(`${JSON.stringify(spec, null, 2)}\n`);
+  out(`${paint(spec.profile, color.bold)}  ${spec.mode}  ${spec.canonicalCwd}\n`);
+  out(`  ${paint("Pi", color.grey)} ${spec.piExecutable} (${spec.expectedPiVersion})\n`);
+  out(`  ${paint("trust", color.grey)} ${spec.trust} (${spec.trustSource})\n`);
+  out(`  ${paint("argv", color.grey)} ${spec.argv.join(" ")}\n`);
+  out(`  ${paint("resource", color.grey)} ${spec.resourceManifestHash}\n`);
 }
 
 function cmdRun(raw) {

@@ -10,7 +10,7 @@ A cc-switch equivalent for the [Pi coding agent](https://github.com/badlogic/pi-
 
 The desktop app provides the same config-safe operations in a clean CC Switch-style interface. It reuses the CLI core, including file locks, backups, atomic writes, schema validation, and macOS Keychain handling.
 
-The Provider form includes credential-free templates for common OpenAI-compatible, Anthropic, DeepSeek, and Volcengine Agent Plan endpoints. Templates only prefill public endpoint/API/model fields; API keys are always entered separately and existing Provider names cannot be overwritten by an add operation.
+The Provider form includes credential-free templates for common OpenAI-compatible, Anthropic, DeepSeek, OpenCode Zen, and Volcengine Agent Plan endpoints. Templates only prefill public endpoint/API/model fields; API keys are always entered separately and existing Provider names cannot be overwritten by an add operation.
 
 The **Provider template catalog** action can refresh those public defaults from this repository's fixed HTTPS catalog. Remote documents are versioned and strictly limited to the template id, label, description, Provider name, base URL, API type, and model id. Unknown fields, credential fields, redirects, non-HTTPS endpoints, unsupported API types, oversized responses, and invalid cache fingerprints are rejected. A successful sync writes only `~/.pi/agent/pi-switch-provider-catalog.json`; it never changes `models.json`, and the UI can discard the cache to return to the templates bundled with the app.
 
@@ -28,6 +28,8 @@ The macOS application is written to:
 ```text
 src-tauri/target/release/bundle/macos/Pi Switch.app
 ```
+
+Provider names may contain Unicode letters, numbers, spaces, `.`, `_` and `-`; they must not start or end with spaces or contain `/`.
 
 The desktop bridge receives secrets through stdin, never command-line arguments, and does not return provider API keys to the webview.
 
@@ -81,11 +83,14 @@ Model capabilities and context windows are kept separate from their evidence. A 
 
 For Qwen 3.8 Max Preview on an Anthropic-compatible Token Plan endpoint, Pi Switch records `thinkingLevelMap.off = null`. Pi then clamps an inherited `off` session to a supported thinking level instead of sending the endpoint's rejected `enable_thinking: false` value.
 
+For Kimi K2/K3 models on OpenAI-compatible endpoints, Pi Switch records `compat.supportsDeveloperRole = false`: those endpoints accept `system` but reject the `developer` role Pi otherwise uses for reasoning models. A matching endpoint error is diagnosed with a repair hint instead of a raw JSON wall.
+
 ## Commands
 
 ```
 pi-switch                          interactive switcher
 pi-switch profiles                list startup profiles
+pi-switch resolve-profile <name>  print a machine-readable launch contract
 pi-switch run [profile]           launch Pi with a pinned workflow mode
 pi-switch ls                       providers and the active default
 pi-switch use <provider> [model]   set the default
@@ -118,7 +123,9 @@ pi-switch run novel --dry-run       # inspect without launching
 
 The default `code` profile keeps the caller's current directory when launched from the CLI. A non-fixed profile may also define `desktopCwd`; the desktop launch button uses that directory because a packaged app's process cwd is its internal `Contents/Resources` folder, not a user project. When `desktopCwd` is absent, the desktop falls back to the user's home directory. Fixed workflow profiles continue to use `cwd`. A profile cannot define both `cwd` and `desktopCwd`. `/mode` remains a lightweight in-session switch; it does not replace startup resource isolation.
 
-`--json` works on `ls`, `test`, `import`, `mcp ls`, `skills ls`, `agents ls` and `doctor`. `test`, `doctor` and `agents` exit non-zero when they find an error, so they drop into a pre-commit hook or CI step as-is.
+`pi-switch resolve-profile <name>` prints the launch contract a host would need to start that profile itself: the canonical working directory, Pi executable and version, trust decision, argv, environment, and a hash of the project resource manifest. `--cwd <path>` lets a caller request a specific workspace; fixed profiles reject a cwd outside their configured root. `--json` makes the contract machine-readable.
+
+`--json` works on `ls`, `test`, `import`, `profiles`, `resolve-profile`, `mcp ls`, `skills ls`, `agents ls` and `doctor`. `test`, `doctor` and `agents` exit non-zero when they find an error, so they drop into a pre-commit hook or CI step as-is.
 
 `settings.skills` exclusion patterns are shown as neutral `exclude` rows. A zero match on an exclusion is expected and is not a broken Skill path; missing concrete paths remain errors.
 

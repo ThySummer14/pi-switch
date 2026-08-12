@@ -1,6 +1,6 @@
 {
   "name": "pi-switch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Provider, model, profile, MCP, skill, and agent switcher for the Pi coding agent",
   "type": "module",
   "license": "MIT",
@@ -13,7 +13,8 @@
   "files": [
     "bin",
     "src",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "node --test 'test/*.test.mjs'",

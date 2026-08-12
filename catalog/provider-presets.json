@@ -1,7 +1,7 @@
 {
   "format": "pi-switch-provider-catalog",
   "version": 1,
-  "updatedAt": "2026-08-01T00:00:00.000Z",
+  "updatedAt": "2026-08-13T00:00:00.000Z",
   "presets": [
     {
       "id": "openai",
@@ -29,6 +29,15 @@
       "baseUrl": "https://api.deepseek.com",
       "api": "openai-completions",
       "model": "deepseek-chat"
+    },
+    {
+      "id": "opencode-zen",
+      "label": "OpenCode Zen",
+      "description": "OpenCode Zen OpenAI-compatible API；包含免费模型，需要 Zen API Key。",
+      "name": "OpenCode Zen",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "api": "openai-completions",
+      "model": "deepseek-v4-flash-free"
     },
     {
       "id": "openrouter",

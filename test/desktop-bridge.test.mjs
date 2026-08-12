@@ -168,6 +168,29 @@ test("desktop can add a provider with a Chinese name", () => {
   assert.equal(models.providers["米醋中转"].models[0].id, "grok-4.5");
 });
 
+test("desktop can add a provider with an English name containing spaces", () => {
+  const result = spawnSync(process.execPath, ["desktop/bridge.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: { ...process.env, PI_CODING_AGENT_DIR: dir },
+    input: JSON.stringify({
+      action: "addProvider",
+      payload: {
+        name: "OpenAI API",
+        baseUrl: "https://english.example/v1",
+        api: "openai-completions",
+        key: "test-key",
+        model: "gpt-5",
+        storeKeychain: false,
+      },
+    }),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok, true);
+  const models = JSON.parse(readFileSync(join(dir, "models.json"), "utf8"));
+  assert.equal(models.providers["OpenAI API"].models[0].id, "gpt-5");
+});
+
 test("desktop dashboard exposes credential-free provider presets", () => {
   const result = spawnSync(process.execPath, ["desktop/bridge.mjs"], {
     cwd: new URL("..", import.meta.url),

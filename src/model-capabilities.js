@@ -87,6 +87,12 @@ const ALWAYS_THINKING_FAMILIES = [
   /(?:^|[\/_-])qwen3\.8(?:$|[\/.\/_-])/i,
 ];
 
+// Kimi-compatible OpenAI endpoints currently accept `system` but reject the
+// newer `developer` role that Pi otherwise uses for reasoning models.
+const SYSTEM_ROLE_ONLY_FAMILIES = [
+  /(?:^|[\/_-])kimi-k[23](?:$|[\/.\/_-])/i,
+];
+
 // Curated values copied from the public provider/model catalogs used by
 // CC Switch and OpenCode.  Exact ids win over family guesses so a future
 // dated variant does not silently inherit an old model's limit.
@@ -99,6 +105,7 @@ const KNOWN_CONTEXT_WINDOWS = new Map([
   ["ark-code-latest", 256_000],
   ["doubao-seed-2-1-pro-260628", 262_144],
   ["deepseek-v4-flash", 1_000_000],
+  ["deepseek-v4-flash-free", 1_000_000],
   ["deepseek-v4-pro", 1_000_000],
   ["qwen3-coder-plus", 1_048_576],
   ["step-3.7-flash", 262_144],
@@ -228,6 +235,10 @@ function knownReasoning(id) {
 
 function knownAlwaysThinking(id) {
   return ALWAYS_THINKING_FAMILIES.some(pattern => pattern.test(normalizeModelId(id)));
+}
+
+function knownSystemRoleOnly(id) {
+  return SYSTEM_ROLE_ONLY_FAMILIES.some(pattern => pattern.test(normalizeModelId(id)));
 }
 
 function knownImage(id) {
@@ -397,6 +408,9 @@ export function inferModelCapabilities(id, { api, declared } = {}) {
  * wins when these hints are merged by the CRUD layer.
  */
 export function inferModelTransport(id, { api } = {}) {
+  if ((api === "openai-completions" || api === "openai-responses") && knownSystemRoleOnly(id)) {
+    return { compat: { supportsDeveloperRole: false } };
+  }
   if (api === "anthropic-messages" && knownAlwaysThinking(id)) {
     return { thinkingLevelMap: { off: null } };
   }

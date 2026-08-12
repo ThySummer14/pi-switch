@@ -187,6 +187,23 @@ test("Qwen 3.8 Anthropic endpoints cannot disable thinking", () => {
   assert.deepEqual(model.thinkingLevelMap, { off: null });
 });
 
+test("Kimi OpenAI endpoints use the system role instead of developer", () => {
+  for (const api of ["openai-completions", "openai-responses"]) {
+    const defaults = capabilities.createModelDefaults("kimi-k3", "火山引擎", { api });
+    assert.deepEqual(defaults.compat, { supportsDeveloperRole: false }, api);
+  }
+
+  providers.upsertProvider("kimi-legacy", {
+    baseUrl: "https://ark.example/api/plan/v3",
+    api: "openai-completions",
+    apiKey: "test-key",
+    models: [{ id: "kimi-k3", contextWindow: 1_048_576, reasoning: true }],
+  });
+  const result = providers.repairModelCapabilities("kimi-legacy", "kimi-k3");
+  assert.deepEqual(result.changed, ["kimi-k3"]);
+  assert.deepEqual(providers.getProvider("kimi-legacy").models[0].compat, { supportsDeveloperRole: false });
+});
+
 test("repair preserves confirmed server declarations", () => {
   providers.upsertModel("relay", {
     id: "grok-4.5",

@@ -89,17 +89,19 @@ test("the active default model cannot be deleted", () => {
 test("upsertProvider validates the api name and requires a baseUrl", () => {
   assert.throws(() => providers.upsertProvider("x", { api: "made-up", baseUrl: "https://x" }), /is not an api pi implements/);
   assert.throws(() => providers.upsertProvider("x", { api: "openai-completions" }), /baseUrl is required/);
-  assert.throws(() => providers.upsertProvider("bad name", { api: "openai-completions", baseUrl: "https://x" }), /may only contain Unicode letters/);
+  assert.throws(() => providers.upsertProvider(" bad-name", { api: "openai-completions", baseUrl: "https://x" }), /must not start or end with spaces/);
   assert.throws(() => providers.upsertProvider("bad/name", { api: "openai-completions", baseUrl: "https://x" }), /may only contain Unicode letters/);
 });
 
-test("provider names support Chinese and other Unicode letters", () => {
+test("provider names support English, spaces, Chinese and other Unicode letters", () => {
   const config = {
     api: "openai-completions",
     baseUrl: "https://unicode.example/v1",
     apiKey: "test-key",
     models: [{ id: "m1" }],
   };
+  providers.upsertProvider("OpenAI API", config);
+  assert.deepEqual(providers.getProvider("OpenAI API"), config);
   providers.upsertProvider("米醋中转", config);
   assert.deepEqual(providers.getProvider("米醋中转"), config);
 });
@@ -120,7 +122,7 @@ test("duplicateProvider copies models and key references without resolving the k
   assert.deepEqual(copy.models, source.models);
   assert.equal(copy.apiKey, source.apiKey);
   assert.throws(() => providers.duplicateProvider("relay", "relay-副本"), /already exists/);
-  assert.throws(() => providers.duplicateProvider("relay", "bad name"), /may only contain Unicode letters/);
+  assert.throws(() => providers.duplicateProvider("relay", "bad/name"), /may only contain Unicode letters/);
   assert.throws(() => providers.duplicateProvider("relay", "relay"), /different name/);
 });
 

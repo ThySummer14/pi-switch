@@ -42,6 +42,15 @@ export const PROVIDER_PRESETS = [
     model: "deepseek-chat",
   },
   {
+    id: "opencode-zen",
+    label: "OpenCode Zen",
+    description: "OpenCode Zen OpenAI-compatible API；包含免费模型，需要 Zen API Key。",
+    name: "OpenCode Zen",
+    baseUrl: "https://opencode.ai/zen/v1",
+    api: "openai-completions",
+    model: "deepseek-v4-flash-free",
+  },
+  {
     id: "openrouter",
     label: "OpenRouter",
     description: "聚合多家模型的 OpenAI-compatible API；模型 ID 可按账户权限替换。",

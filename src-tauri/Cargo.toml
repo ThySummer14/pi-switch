@@ -1,6 +1,6 @@
 [package]
 name = "pi-switch-desktop"
-version = "0.3.0"
+version = "0.4.0"
 description = "Desktop configuration manager for the Pi coding agent"
 authors = ["Pi Switch"]
 license = "MIT"
